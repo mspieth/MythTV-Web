@@ -49,7 +49,30 @@ let controlsHideTimer = null;
 let forwardSkipTimer = null;
 let forwardSkipMode = false;
 let liveRecordingTimer = null;
+let playerController = null;
+let playerGeneration = 0;
+let playbackReady = false;
 const BROWSER_CONVERSION_ENABLED = false;
+
+function waitForPlayerEvent(eventName, signal, timeout = 30_000) {
+  return new Promise((resolve) => {
+    let timer;
+    const finish = (ready) => {
+      window.clearTimeout(timer);
+      playerVideo.removeEventListener(eventName, onReady);
+      playerVideo.removeEventListener("error", onError);
+      signal.removeEventListener("abort", onError);
+      resolve(ready);
+    };
+    const onReady = () => finish(true);
+    const onError = () => finish(false);
+    if (signal.aborted) return finish(false);
+    playerVideo.addEventListener(eventName, onReady, { once: true });
+    playerVideo.addEventListener("error", onError, { once: true });
+    signal.addEventListener("abort", onError, { once: true });
+    timer = window.setTimeout(onError, timeout);
+  });
+}
 
 function appPath(path) {
   return `${appRoot}${path}`;
@@ -158,11 +181,14 @@ function updateCommercialBreaks(markers) {
 
 async function refreshLiveRecording(recordedId) {
   if (activeRecording?.Recording?.RecordedId !== recordedId) return;
+  const controller = playerController;
   try {
-    const response = await fetch(appPath(`/api/playback/${recordedId}/live-status`));
+    const response = await fetch(appPath(`/api/playback/${recordedId}/live-status`), {
+      signal: controller.signal,
+    });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
     const status = await response.json();
-    if (activeRecording?.Recording?.RecordedId !== recordedId) return;
+    if (controller !== playerController || controller.signal.aborted) return;
     if (status.end_time) {
       activeRecording.EndTime = status.end_time;
       activeRecording.Recording.EndTs = status.end_time;
@@ -174,7 +200,9 @@ async function refreshLiveRecording(recordedId) {
       liveRecordingTimer = null;
     }
   } catch (error) {
-    playerStatus.textContent = `Could not refresh live recording status: ${error.message}`;
+    if (controller === playerController && !controller.signal.aborted) {
+      playerStatus.textContent = `Could not refresh live recording status: ${error.message}`;
+    }
   }
 }
 
@@ -188,6 +216,7 @@ function startLiveRecordingUpdates(recordedId) {
 }
 
 function updatePlaybackProgress() {
+  if (!activeRecording || !playbackReady) return;
   const position = playbackPosition();
   const duration = playbackDuration(activeRecording || {}) || playerVideo.duration || 0;
   document.querySelector("#playback-elapsed").textContent = formatPlaybackTime(position);
@@ -199,7 +228,8 @@ function updatePlaybackProgress() {
 }
 
 async function savePlaybackPosition() {
-  if (!activeRecording) return;
+  if (!activeRecording || !playbackReady) return;
+  const generation = playerGeneration;
   const recordedId = activeRecording.Recording.RecordedId;
   const position = playbackPosition();
   if (!Number.isFinite(position) || position < 0) return;
@@ -209,10 +239,11 @@ async function savePlaybackPosition() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ position }),
+      keepalive: true,
     });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
   } catch (error) {
-    if (activeRecording?.Recording.RecordedId === recordedId) {
+    if (generation === playerGeneration && activeRecording?.Recording.RecordedId === recordedId) {
       lastSavedPosition = -1;
       playerStatus.textContent = `Could not save playback position: ${error.message}`;
     }
@@ -257,6 +288,7 @@ function createTranscodeToken() {
 }
 
 function startTranscode(seconds = 0) {
+  if (!activeRecording || !playerController || playerController.signal.aborted) return;
   stopWasmPlayback();
   cancelTranscode();
   usingWasm = false;
@@ -264,16 +296,22 @@ function startTranscode(seconds = 0) {
   transcodeBase = seconds;
   const playbackRate = Number(document.querySelector("#playback-speed").value) || 1;
   transcodeToken = createTranscodeToken();
+  const token = transcodeToken;
+  const generation = playerGeneration;
+  playbackReady = false;
   playerStatus.textContent = "Preparing a live browser-compatible stream…";
-  playerVideo.addEventListener("loadedmetadata", function restorePlaybackRate() {
-    playerVideo.removeEventListener("loadedmetadata", restorePlaybackRate);
+  waitForPlayerEvent("loadedmetadata", playerController.signal).then((ready) => {
+    if (!ready || generation !== playerGeneration || token !== transcodeToken) return;
+    playbackReady = true;
     playerVideo.playbackRate = playbackRate;
     if ("preservesPitch" in playerVideo) playerVideo.preservesPitch = true;
   });
   playerVideo.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/transcode?start=${encodeURIComponent(seconds)}&token=${transcodeToken}`);
   playerVideo.load();
   playerVideo.play().catch(() => {
-    playerStatus.textContent = "Stream ready. Press Play to begin.";
+    if (generation === playerGeneration && token === transcodeToken) {
+      playerStatus.textContent = "Stream ready. Press Play to begin.";
+    }
   });
 }
 
@@ -299,6 +337,7 @@ async function selectSubtitle(streamIndex) {
   );
   if (!trackInfo) return;
   const track = document.createElement("track");
+  const generation = playerGeneration;
   track.kind = "subtitles";
   track.label = trackInfo.title || (
     trackInfo.language && trackInfo.language !== "und"
@@ -308,10 +347,12 @@ async function selectSubtitle(streamIndex) {
   track.srclang = /^[a-z]{2,3}$/i.test(trackInfo.language) ? trackInfo.language : "und";
   track.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/subtitles/${streamIndex}`);
   track.addEventListener("load", () => {
+    if (generation !== playerGeneration || subtitleElement !== track) return;
     track.track.mode = "showing";
     playerStatus.textContent = `Subtitles: ${track.label}`;
   });
   track.addEventListener("error", () => {
+    if (generation !== playerGeneration || subtitleElement !== track) return;
     playerStatus.textContent = trackInfo.codec === "dvb_subtitle"
       ? "This DVB bitmap subtitle could not be converted to browser text subtitles."
       : `Could not load subtitle track: ${track.label}`;
@@ -322,6 +363,8 @@ async function selectSubtitle(streamIndex) {
 }
 
 async function startWasmTranscode(seconds = 0) {
+  if (!activeRecording) return;
+  const generation = playerGeneration;
   stopWasmPlayback();
   cancelTranscode();
   usingTranscode = false;
@@ -331,7 +374,7 @@ async function startWasmTranscode(seconds = 0) {
   playerStatus.textContent = "Preparing browser-side conversion…";
   try {
     const { startWasmPlayback } = await import("./browser_playback.js");
-    if (recording !== activeRecording) return;
+    if (generation !== playerGeneration || recording !== activeRecording) return;
     const session = await startWasmPlayback({
       sourceURL: appPath(`/api/playback/${recording.Recording.RecordedId}/stream`),
       coreURL: appPath("/static/vendor/ffmpeg-core.js"),
@@ -343,13 +386,16 @@ async function startWasmTranscode(seconds = 0) {
       sourceVideoProfile: playbackInfo.media.video_profile,
       sourceVideoLevel: playbackInfo.media.video_level,
       sourceVideoPixelFormat: playbackInfo.media.video_pixel_format,
-      onStatus: (status) => { playerStatus.textContent = status; },
+      onStatus: (status) => {
+        if (generation === playerGeneration && recording === activeRecording) playerStatus.textContent = status;
+      },
     });
-    if (recording !== activeRecording) {
+    if (generation !== playerGeneration || recording !== activeRecording) {
       session.cancel();
       return;
     }
     wasmPlayback = session;
+    playbackReady = true;
     session.done.catch((error) => {
       if (wasmPlayback !== session || recording !== activeRecording) return;
       const position = playbackPosition();
@@ -357,10 +403,12 @@ async function startWasmTranscode(seconds = 0) {
       startTranscode(position);
     });
     playerVideo.play().catch(() => {
-      playerStatus.textContent = "Browser conversion ready. Press Play to begin.";
+      if (generation === playerGeneration && recording === activeRecording) {
+        playerStatus.textContent = "Browser conversion ready. Press Play to begin.";
+      }
     });
   } catch (error) {
-    if (recording === activeRecording) {
+    if (generation === playerGeneration && recording === activeRecording) {
       playerStatus.textContent = `Browser conversion unavailable; using server fallback: ${error.message}`;
       startTranscode(seconds);
     }
@@ -370,7 +418,19 @@ async function startWasmTranscode(seconds = 0) {
 async function openPlayer(program, startMode = "resume") {
   const recordedId = program.Recording?.RecordedId;
   if (!recordedId) return;
+  cancelTranscode();
+  playerController?.abort();
+  const controller = new AbortController();
+  playerController = controller;
+  const generation = ++playerGeneration;
+  const isCurrent = () => generation === playerGeneration && !controller.signal.aborted;
+  playbackReady = false;
   activeRecording = program;
+  playerVideo.pause();
+  playerVideo.removeAttribute("src");
+  playerVideo.load();
+  subtitleElement?.remove();
+  subtitleElement = null;
   window.clearInterval(liveRecordingTimer);
   liveRecordingTimer = null;
   setForwardSkipMode(false);
@@ -383,6 +443,7 @@ async function openPlayer(program, startMode = "resume") {
   transcodeBase = 0;
   stopWasmPlayback();
   lastSavedPosition = -1;
+  requestedStartPosition = 0;
   document.querySelector("#player-title").textContent = program.SubTitle || program.Title;
   document.querySelector("#player-subtitle").textContent = [
     program.Title,
@@ -395,13 +456,17 @@ async function openPlayer(program, startMode = "resume") {
   document.querySelector("#player-details").open = false;
   playerStatus.textContent = "Loading MythTV playback details…";
   playerReturnFocus = document.activeElement;
-  playerDialog.showModal();
+  if (!playerDialog.open) playerDialog.showModal();
   playerVideo.focus({ preventScroll: true });
 
   try {
-    const response = await fetch(appPath(`/api/playback/${recordedId}`));
+    const response = await fetch(appPath(`/api/playback/${recordedId}`), {
+      signal: controller.signal,
+    });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
-    playbackInfo = await response.json();
+    const info = await response.json();
+    if (!isCurrent()) return;
+    playbackInfo = info;
     if (playbackInfo.program) {
       activeRecording = {
         ...program,
@@ -441,55 +506,55 @@ async function openPlayer(program, startMode = "resume") {
       if (BROWSER_CONVERSION_ENABLED) startWasmTranscode(resumePosition);
       else startTranscode(resumePosition);
     } else {
-      const metadataReady = new Promise((resolve) => {
-        playerVideo.addEventListener("loadedmetadata", resolve, { once: true });
-      });
+      const metadataReady = waitForPlayerEvent("loadedmetadata", controller.signal);
       playerVideo.src = appPath(`/api/playback/${recordedId}/stream`);
       playerVideo.load();
-      await metadataReady;
+      const ready = await metadataReady;
+      if (!isCurrent() || usingTranscode || usingWasm) return;
+      if (!ready) throw new Error("Timed out loading recording metadata.");
       const duration = Number.isFinite(playerVideo.duration) ? playerVideo.duration : 0;
       const seekPosition = duration > 0
         ? Math.min(resumePosition, Math.max(0, duration - 0.5))
         : resumePosition;
       lastSavedPosition = seekPosition;
       if (seekPosition > 0.5) {
-        const seeked = new Promise((resolve) => {
-          playerVideo.addEventListener("seeked", resolve, { once: true });
-        });
+        const seeked = waitForPlayerEvent("seeked", controller.signal, 5000);
         playerVideo.currentTime = seekPosition;
-        if (playerVideo.seeking) {
-          await Promise.race([
-            seeked,
-            new Promise((resolve) => window.setTimeout(resolve, 5000)),
-          ]);
-        }
+        await seeked;
+        if (!isCurrent() || usingTranscode || usingWasm) return;
       }
+      playbackReady = true;
       updatePlaybackProgress();
       await playerVideo.play().then(() => {
+        if (!isCurrent()) return;
         requestedStartPosition = 0;
         playerStatus.textContent = commercialBreaks.length
           ? `${commercialBreaks.length} commercial break markers loaded`
           : "No commercial break markers are available for this recording.";
       }).catch(() => {
-        playerStatus.textContent = "Stream ready. Press Play to begin.";
+        if (isCurrent()) playerStatus.textContent = "Stream ready. Press Play to begin.";
       });
     }
   } catch (error) {
-    playerStatus.textContent = error.message;
+    if (isCurrent()) playerStatus.textContent = error.message;
   }
 }
 
-async function closePlayer() {
+function closePlayer() {
   if (document.fullscreenElement === playerShell) {
     document.exitFullscreen().catch((error) => {
       playerStatus.textContent = `Could not exit fullscreen: ${error.message}`;
     });
   }
   if (!activeRecording) return;
+  savePlaybackPosition();
+  playerController?.abort();
+  playerController = null;
+  playerGeneration += 1;
+  playbackReady = false;
   window.clearInterval(liveRecordingTimer);
   liveRecordingTimer = null;
   setForwardSkipMode(false);
-  await savePlaybackPosition();
   cancelTranscode();
   stopWasmPlayback();
   playerVideo.pause();
@@ -1050,6 +1115,7 @@ document.querySelector("#playback-speed").addEventListener("change", (event) => 
 });
 setBookmarkButton.addEventListener("click", async () => {
   if (!activeRecording) return;
+  const generation = playerGeneration;
   const recordedId = activeRecording.Recording.RecordedId;
   const position = playbackPosition();
   setBookmarkButton.disabled = true;
@@ -1060,13 +1126,14 @@ setBookmarkButton.addEventListener("click", async () => {
       body: JSON.stringify({ position }),
     });
     const result = await response.json();
+    if (generation !== playerGeneration) return;
     if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
     if (activeRecording?.Recording.RecordedId === recordedId && playbackInfo) {
       playbackInfo.bookmark = Math.round(position * 1000);
     }
     playerStatus.textContent = `MythTV bookmark set at ${formatPlaybackTime(position)}`;
   } catch (error) {
-    playerStatus.textContent = `Could not set MythTV bookmark: ${error.message}`;
+    if (generation === playerGeneration) playerStatus.textContent = `Could not set MythTV bookmark: ${error.message}`;
   } finally {
     setBookmarkButton.disabled = false;
   }

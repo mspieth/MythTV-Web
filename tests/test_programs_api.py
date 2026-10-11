@@ -1,4 +1,5 @@
 import json
+import os
 import signal
 import sqlite3
 import subprocess
@@ -14,14 +15,19 @@ from mythtv_web import create_app
 @pytest.fixture(autouse=True)
 def authenticated_api_clients(monkeypatch, tmp_path):
     monkeypatch.setenv("MYTHTV_AUTH_DATABASE", str(tmp_path / "users.sqlite"))
+    monkeypatch.setenv("MYTHTV_SUBTITLE_CACHE_DIR", str(tmp_path / "subtitles"))
     original_test_client = Flask.test_client
 
     def test_client(app, *args, **kwargs):
         client = original_test_client(app, *args, **kwargs)
         with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
             connection.execute("UPDATE users SET must_change_password = 0 WHERE id = 1")
+            token = connection.execute(
+                "SELECT session_token FROM users WHERE id = 1"
+            ).fetchone()[0]
         with client.session_transaction() as user_session:
             user_session["user_id"] = 1
+            user_session["session_token"] = token
         return client
 
     monkeypatch.setattr(Flask, "test_client", test_client)
@@ -1267,17 +1273,33 @@ def test_transcode_cancel_terminates_only_a_tokenized_process(monkeypatch, tmp_p
     token = "a" * 32
     transcode_dir = tmp_path / "transcodes"
     transcode_dir.mkdir()
-    (transcode_dir / f"{token}.pid").write_text("4321")
     captured = {}
 
-    def fake_kill(process_id, process_signal):
-        captured["process_id"] = process_id
+    def fake_signal(descriptor, process_signal):
+        captured["descriptor"] = descriptor
         captured["signal"] = process_signal
 
-    monkeypatch.setattr("mythtv_web.os.kill", fake_kill)
+    identity = {"start": "123", "boot": "boot", "executable": "/usr/bin/ffmpeg"}
+    monkeypatch.setattr("mythtv_web.transcodes._process_identity", lambda _: identity)
+    descriptor = os.open("/dev/null", os.O_RDONLY)
+    monkeypatch.setattr("mythtv_web.transcodes.os.pidfd_open", lambda _: descriptor)
+    monkeypatch.setattr("mythtv_web.transcodes.signal.pidfd_send_signal", fake_signal)
     app = create_app()
     app.config["MYTHTV_TRANSCODE_DIR"] = str(transcode_dir)
     client = app.test_client()
+    with client.session_transaction() as saved:
+        owner_token = saved["session_token"]
+    (transcode_dir / f"{token}.json").write_text(
+        json.dumps(
+            {
+                "pid": 4321,
+                "identity": identity,
+                "recorded_id": 42,
+                "user_id": 1,
+                "session_token": owner_token,
+            }
+        )
+    )
 
     response = client.post("/api/playback/42/transcode/cancel", json={"token": token})
     invalid_response = client.post(
@@ -1286,7 +1308,7 @@ def test_transcode_cancel_terminates_only_a_tokenized_process(monkeypatch, tmp_p
 
     assert response.status_code == 200
     assert response.json == {"cancelled": True}
-    assert captured == {"process_id": 4321, "signal": signal.SIGTERM}
+    assert captured == {"descriptor": descriptor, "signal": signal.SIGTERM}
     assert invalid_response.status_code == 400
 
 
@@ -1308,6 +1330,9 @@ def test_transcode_stream_removes_process_registration_after_completion(
 
         def read1(self, _size):
             return self.chunks.pop(0)
+
+        def close(self):
+            pass
 
     class Process:
         pid = 9876
@@ -1331,6 +1356,9 @@ def test_transcode_stream_removes_process_registration_after_completion(
 
     monkeypatch.setattr("mythtv_web.shutil.which", lambda _: "/usr/bin/ffmpeg")
     monkeypatch.setattr("mythtv_web.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "mythtv_web.transcodes._process_identity", lambda _: {"start": "123"}
+    )
     app = create_app()
     app.config["MYTHTV_RECORDINGS_CACHE_PATH"] = str(cache_path)
     app.config["MYTHTV_TRANSCODE_DIR"] = str(tmp_path / "transcodes")
@@ -1338,11 +1366,12 @@ def test_transcode_stream_removes_process_registration_after_completion(
     response = app.test_client().get(
         f"/api/playback/42/transcode?start=123.5&token={token}", buffered=False
     )
-    process_path = tmp_path / "transcodes" / f"{token}.pid"
+    process_path = tmp_path / "transcodes" / f"{token}.json"
 
     assert response.status_code == 200
     assert commands[0][commands[0].index("-ss") + 1] == "123.5"
-    assert process_path.read_text() == "9876"
+    assert json.loads(process_path.read_text())["pid"] == 9876
+    assert commands[0][commands[0].index("-threads:v") + 1] == "2"
     assert b"".join(response.response) == b"fragment"
     assert process.terminated
     assert not process_path.exists()
@@ -1423,6 +1452,55 @@ def test_artwork_proxy_forwards_only_mythtv_image_parameters(monkeypatch):
     assert response.headers["Cache-Control"] == "public, max-age=3600"
     assert captured["url"] == "http://backend:6544/Content/GetImageFile"
     assert captured["params"] == {"StorageGroup": "Coverart", "FileName": "/cover.jpg"}
+
+
+@pytest.mark.parametrize("endpoint", ["position", "bookmark", "transcode/cancel"])
+@pytest.mark.parametrize(
+    "payload", [[], "text", 1, True, {"token": 1}, {"position": 10**400}]
+)
+def test_playback_mutations_reject_invalid_json(monkeypatch, endpoint, payload):
+    monkeypatch.setattr("mythtv_web._active_recording", lambda *_: {"Recording": {}})
+    response = (
+        create_app().test_client().post(f"/api/playback/42/{endpoint}", json=payload)
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "result", [{}, [], {"bool": False}, {"bool": "true"}, {"bool": 1}]
+)
+def test_schedule_update_requires_explicit_backend_success(monkeypatch, result):
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.payload
+
+    monkeypatch.setattr(
+        "mythtv_web.requests.get", lambda *_a, **_k: Response({"RecRule": {"Id": 42}})
+    )
+    monkeypatch.setattr("mythtv_web.requests.post", lambda *_a, **_k: Response(result))
+    response = create_app().test_client().post("/api/schedules/42", json={"rule": {}})
+    assert response.status_code == 502
+
+
+@pytest.mark.parametrize(
+    "payload", [[], {"ProgramList": []}, {"ProgramList": {"Programs": [None]}}]
+)
+def test_programs_reject_malformed_backend_lists(monkeypatch, payload):
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr("mythtv_web.requests.get", lambda *_a, **_k: Response())
+    assert create_app().test_client().get("/api/programs").status_code == 502
 
 
 def test_artwork_proxy_rejects_arbitrary_upstream_urls(monkeypatch):

@@ -28,11 +28,12 @@ auth = Blueprint("auth", __name__)
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 MIN_PASSWORD_LENGTH = 12
 USER_TABLE_SQL = """CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('admin', 'user', 'guest')),
-    must_change_password INTEGER NOT NULL DEFAULT 0
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    session_token TEXT NOT NULL DEFAULT (lower(hex(randomblob(32))))
 )"""
 
 
@@ -53,7 +54,7 @@ def _connect():
 def _load_user(user_id: int) -> dict | None:
     with _connect() as connection:
         row = connection.execute(
-            "SELECT id, username, role, must_change_password FROM users WHERE id = ?",
+            "SELECT id, username, role, must_change_password, session_token FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
     if row is None:
@@ -63,6 +64,7 @@ def _load_user(user_id: int) -> dict | None:
         "username": row["username"],
         "role": row["role"],
         "must_change_password": bool(row["must_change_password"]),
+        "session_token": row["session_token"],
     }
 
 
@@ -96,13 +98,19 @@ def _initialize_database(app) -> None:
         schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
         ).fetchone()[0]
-        if "'guest'" not in schema.lower():
+        if (
+            "'guest'" not in schema.lower()
+            or "autoincrement" not in schema.lower()
+            or "session_token" not in schema.lower()
+        ):
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
             connection.execute("ALTER TABLE users RENAME TO users_before_guest_role")
             connection.execute(USER_TABLE_SQL)
+            fields = "id, username, password_hash, role, must_change_password"
+            if "session_token" in columns:
+                fields += ", session_token"
             connection.execute(
-                "INSERT INTO users (id, username, password_hash, role, must_change_password) "
-                "SELECT id, username, password_hash, role, must_change_password "
-                "FROM users_before_guest_role"
+                f"INSERT INTO users ({fields}) SELECT {fields} FROM users_before_guest_role"
             )
             connection.execute("DROP TABLE users_before_guest_role")
         has_users = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -129,7 +137,6 @@ def init_auth(app) -> None:
     app.config.setdefault("INITIAL_ADMIN_USERNAME", "admin")
     app.config.setdefault("INITIAL_ADMIN_PASSWORD", "mythtv-admin")
     app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
-    app.config.setdefault("SESSION_COOKIE_SAMESITE", "Strict")
     app.secret_key = _get_secret_key(app)
     _initialize_database(app)
     app.register_blueprint(auth)
@@ -138,9 +145,16 @@ def init_auth(app) -> None:
     def load_authenticated_user():
         g.current_user = None
         user_id = session.get("user_id")
-        if isinstance(user_id, int):
-            g.current_user = _load_user(user_id)
-            if g.current_user is None:
+        if type(user_id) is int:
+            user = _load_user(user_id)
+            token = session.get("session_token")
+            if (
+                user
+                and isinstance(token, str)
+                and hmac.compare_digest(token.encode(), user["session_token"].encode())
+            ):
+                g.current_user = user
+            else:
                 session.clear()
 
         endpoint = request.endpoint or ""
@@ -153,7 +167,14 @@ def init_auth(app) -> None:
             supplied_token = request.form.get("csrf_token") or request.headers.get(
                 "X-CSRF-Token", ""
             )
-            if not hmac.compare_digest(supplied_token, session.get("csrf_token", "")):
+            expected_token = session.get("csrf_token")
+            if (
+                not supplied_token
+                or not expected_token
+                or not hmac.compare_digest(
+                    supplied_token.encode(), expected_token.encode()
+                )
+            ):
                 abort(400, "Invalid CSRF token")
 
         if endpoint in {"static", "healthz", "auth.login"}:
@@ -235,7 +256,7 @@ def login():
     password = request.form.get("password", "")
     with _connect() as connection:
         user = connection.execute(
-            "SELECT id, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+            "SELECT id, password_hash, session_token, must_change_password FROM users WHERE username = ? COLLATE NOCASE",
             (username,),
         ).fetchone()
     if user is None or not check_password_hash(user["password_hash"], password):
@@ -251,9 +272,9 @@ def login():
     session.clear()
     session.permanent = True
     session["user_id"] = user["id"]
+    session["session_token"] = user["session_token"]
     session["csrf_token"] = secrets.token_urlsafe(32)
-    authenticated_user = _load_user(user["id"])
-    if authenticated_user["must_change_password"]:
+    if user["must_change_password"]:
         return redirect(url_for("auth.change_password"))
     return redirect(_safe_next_url(next_url) or url_for("index"))
 
@@ -274,10 +295,14 @@ def change_password():
         new_password = request.form.get("new_password", "")
         confirm_password = request.form.get("confirm_password", "")
         with _connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT password_hash FROM users WHERE id = ?",
+                "SELECT password_hash, session_token FROM users WHERE id = ?",
                 (g.current_user["id"],),
             ).fetchone()
+            if row is None or row["session_token"] != session["session_token"]:
+                session.clear()
+                return redirect(url_for("auth.login"))
             if not check_password_hash(row["password_hash"], current_password):
                 error = "Current password is incorrect."
             elif not _valid_password(new_password):
@@ -285,11 +310,18 @@ def change_password():
             elif new_password != confirm_password:
                 error = "New passwords do not match."
             else:
+                new_token = secrets.token_hex(32)
                 connection.execute(
-                    "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
-                    (generate_password_hash(new_password), g.current_user["id"]),
+                    "UPDATE users SET password_hash = ?, must_change_password = 0, session_token = ? WHERE id = ?",
+                    (
+                        generate_password_hash(new_password),
+                        new_token,
+                        g.current_user["id"],
+                    ),
                 )
         if error is None:
+            session["session_token"] = new_token
+            session["csrf_token"] = secrets.token_urlsafe(32)
             flash("Password changed.")
             return redirect(url_for("index"))
     return render_template("change_password.html", error=error)
@@ -367,11 +399,12 @@ def set_user_password(user_id: int):
         return redirect(url_for("auth.users"))
     with _connect() as connection:
         result = connection.execute(
-            """UPDATE users SET password_hash = ?, must_change_password = ?
+            """UPDATE users SET password_hash = ?, must_change_password = ?, session_token = ?
                WHERE id = ?""",
             (
                 generate_password_hash(password),
                 int("must_change_password" in request.form),
+                secrets.token_hex(32),
                 user_id,
             ),
         )

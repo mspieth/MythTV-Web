@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: MythTV-Web",
+            "type": "debugpy",
+            "request": "launch",
+            "preLaunchTask": "uv: sync dependencies",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "module": "flask",
+            "args": ["--app", "mythtv_web:create_app", "run", "--host", "127.0.0.1", "--port", "6555"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

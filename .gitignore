@@ -8,3 +8,4 @@ __pycache__/
 /node_modules/
 /mythtv_web/static/build/
 /mythtv_web/static/vendor/
+mythtv_web.egg-info/

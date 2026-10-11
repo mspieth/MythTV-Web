@@ -1,6 +1,22 @@
-[tool.black]
-line-length = 88
-target-version = ["py310"]
+[project]
+name = "mythtv-web"
+version = "0.1.0"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = ["flask>=3.1.3", "gunicorn>=23", "requests>=2.34.2"]
+
+[project.scripts]
+mythtv-web = "mythtv_web.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mythtv_web*"]
+
+[tool.setuptools.package-data]
+mythtv_web = ["templates/*", "static/*", "static/**/*"]
 
 [tool.ruff]
 line-length = 88
@@ -13,3 +29,10 @@ select = ["E4", "E7", "E9", "F", "I"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = ["requires_mythtv: test requires a running MythTV backend"]
+
+[dependency-groups]
+dev = [
+    "flask>=3.1,<4",
+    "pytest>=9.1.1",
+    "ruff>=0.14,<1",
+]

@@ -106,6 +106,103 @@ def test_users_page_has_back_to_library_link(tmp_path):
     assert b"Back to library" in response.data
 
 
+def test_login_requires_a_nonempty_csrf_token_and_sets_samesite(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    assert (
+        client.post(
+            "/login", data={"username": "admin", "password": INITIAL_PASSWORD}
+        ).status_code
+        == 400
+    )
+    page = client.get("/login")
+    assert "SameSite=Strict" in page.headers["Set-Cookie"]
+    assert (
+        client.post(
+            "/login", data={"username": "admin", "password": INITIAL_PASSWORD}
+        ).status_code
+        == 400
+    )
+    assert client.post("/login", data={"csrf_token": "invalid-☃"}).status_code == 400
+    assert login(client, "admin", INITIAL_PASSWORD).status_code == 302
+
+
+def test_password_change_revokes_other_sessions_but_keeps_current_session(tmp_path):
+    app = make_app(tmp_path)
+    first, second = app.test_client(), app.test_client()
+    login(first, "admin", INITIAL_PASSWORD)
+    login(second, "admin", INITIAL_PASSWORD)
+    assert (
+        rotate_password(first, INITIAL_PASSWORD, UPDATED_ADMIN_PASSWORD).status_code
+        == 302
+    )
+    assert first.get("/").status_code == 200
+    assert second.get("/api/programs").status_code == 401
+
+
+def test_admin_password_reset_revokes_existing_sessions(tmp_path):
+    app = make_app(tmp_path)
+    admin = app.test_client()
+    login(admin, "admin", INITIAL_PASSWORD)
+    rotate_password(admin, INITIAL_PASSWORD, UPDATED_ADMIN_PASSWORD)
+    other = app.test_client()
+    login(other, "admin", UPDATED_ADMIN_PASSWORD)
+    page = admin.get("/admin/users")
+    admin.post(
+        "/admin/users/1/password",
+        data={"csrf_token": csrf_token(page), "password": "replacement-password"},
+    )
+    assert other.get("/api/programs").status_code == 401
+    assert admin.get("/api/programs").status_code == 401
+    assert login(other, "admin", "replacement-password").location == "/"
+
+
+def test_deleted_account_cookies_cannot_authenticate_as_replacements(tmp_path):
+    app = make_app(tmp_path)
+    with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
+        connection.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES ('old-user', 'hash', 'user')"
+        )
+        old_id, token = connection.execute(
+            "SELECT id, session_token FROM users WHERE username = 'old-user'"
+        ).fetchone()
+    old = app.test_client()
+    with old.session_transaction() as saved:
+        saved["user_id"] = old_id
+        saved["session_token"] = token
+    with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
+        connection.execute("DELETE FROM users WHERE id = ?", (old_id,))
+        connection.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES ('replacement', 'hash', 'admin')"
+        )
+        new_id = connection.execute(
+            "SELECT id FROM users WHERE username = 'replacement'"
+        ).fetchone()[0]
+    assert new_id > old_id
+    assert old.get("/api/programs").status_code == 401
+    # Even an explicitly restored numerical ID cannot resurrect a signed cookie.
+    with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
+        connection.execute("UPDATE users SET id = ? WHERE id = ?", (old_id, new_id))
+    with old.session_transaction() as saved:
+        saved["user_id"] = old_id
+        saved["session_token"] = token
+    assert old.get("/admin/users").status_code == 302
+
+
+def test_legacy_sessions_are_rejected_and_migration_is_idempotent(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    with client.session_transaction() as saved:
+        saved["user_id"] = 1
+    assert client.get("/api/programs").status_code == 401
+    login(client, "admin", INITIAL_PASSWORD)
+    rotate_password(client, INITIAL_PASSWORD, UPDATED_ADMIN_PASSWORD)
+    cookie = client.get_cookie("session").value
+    restarted = make_app(tmp_path).test_client()
+    restarted.set_cookie("session", cookie)
+    assert restarted.get("/").status_code == 200
+
+
 def test_login_round_trip_keeps_forwarded_prefix(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()

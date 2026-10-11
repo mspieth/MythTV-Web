@@ -2,6 +2,7 @@
   "name": "mythtv-web-browser-playback-experiment",
   "private": true,
   "scripts": {
+    "test:browser": "node tests/browser_player.test.cjs",
     "build:browser": "node scripts/build_browser.js"
   },
   "dependencies": {
