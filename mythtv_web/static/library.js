@@ -272,6 +272,8 @@ function startTranscode(seconds = 0) {
   });
   playerVideo.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/transcode?start=${encodeURIComponent(seconds)}&token=${transcodeToken}`);
   playerVideo.load();
+  const selectedSubtitle = document.querySelector("#subtitle-track").value;
+  if (["cea608", "cea708"].includes(selectedSubtitle)) selectSubtitle(selectedSubtitle);
   playerVideo.play().catch(() => {
     playerStatus.textContent = "Stream ready. Press Play to begin.";
   });
@@ -306,8 +308,21 @@ async function selectSubtitle(streamIndex) {
       : `Track ${streamIndex}`
   );
   track.srclang = /^[a-z]{2,3}$/i.test(trackInfo.language) ? trackInfo.language : "und";
-  track.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/subtitles/${streamIndex}`);
+  const caption = ["cea608", "cea708"].includes(trackInfo.codec);
+  const subtitlePath = caption ? "captions" : "subtitles";
+  track.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/${subtitlePath}/${streamIndex}`);
+  const cueOffset = usingTranscode || usingWasm ? transcodeBase : 0;
   track.addEventListener("load", () => {
+    if (subtitleElement !== track) return;
+    if (caption && cueOffset > 0) {
+      for (const cue of Array.from(track.track.cues || [])) {
+        if (cue.endTime <= cueOffset) track.track.removeCue(cue);
+        else {
+          cue.startTime = Math.max(0, cue.startTime - cueOffset);
+          cue.endTime -= cueOffset;
+        }
+      }
+    }
     track.track.mode = "showing";
     playerStatus.textContent = `Subtitles: ${track.label}`;
   });

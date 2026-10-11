@@ -25,6 +25,7 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .auth import deletion_allowed, init_auth
+from .captions import extract_captions
 
 DEFAULT_BACKEND_URL = "http://127.0.0.1:6544"
 PRIMARY_RECORDING_GROUP = "Seasons"
@@ -239,6 +240,14 @@ def _probe_recording(app: Flask, recorded_id: int) -> dict:
                     "title": tags.get("title", ""),
                 }
             )
+    if shutil.which("mythccextractor"):
+        subtitles.extend(
+            {"index": standard, "codec": standard, "language": "und", "title": title}
+            for standard, title in (
+                ("cea608", "CEA-608 CC1 (if present)"),
+                ("cea708", "CEA-708 service 1 (if present)"),
+            )
+        )
     return {**codecs, "subtitles": subtitles}
 
 
@@ -1303,6 +1312,41 @@ def create_app(config: dict | None = None) -> Flask:
         except (OSError, ValueError):
             return jsonify(cancelled=False), 404
         return jsonify(cancelled=True)
+
+    @app.get("/api/playback/<int:recorded_id>/captions/<standard>")
+    def playback_captions(recorded_id, standard):
+        if standard not in {"cea608", "cea708"}:
+            return jsonify(error="Caption service not found"), 404
+        try:
+            program = _active_recording(app, recorded_id)
+            if program is None:
+                return jsonify(error="Recording not found"), 404
+            executable = shutil.which("mythccextractor")
+            if executable is None:
+                return jsonify(
+                    error="mythccextractor is required for embedded captions"
+                ), 501
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg is None:
+                return jsonify(error="FFmpeg is required to convert captions"), 501
+            contents = extract_captions(
+                executable, _recording_url(app, recorded_id), standard, ffmpeg
+            )
+        except (
+            requests.RequestException,
+            OSError,
+            ValueError,
+            subprocess.SubprocessError,
+        ) as error:
+            app.logger.warning("Caption extraction failed: %s", error)
+            return jsonify(
+                error="Could not extract captions for the selected service"
+            ), 502
+        return Response(
+            contents,
+            content_type="text/vtt; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/playback/<int:recorded_id>/subtitles/<int:stream_index>")
     def playback_subtitles(recorded_id, stream_index):
