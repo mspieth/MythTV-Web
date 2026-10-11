@@ -1569,7 +1569,8 @@ def test_transcode_stream_removes_process_registration_after_completion(
 
     assert response.status_code == 200
     assert commands[0][commands[0].index("-ss") + 1] == "123.5"
-    assert commands[0][commands[0].index("-re") + 1] == "-i"
+    assert commands[0][commands[0].index("-readrate") + 1] == "2"
+    assert commands[0][commands[0].index("-readrate_initial_burst") + 1] == "2"
     assert process_path.read_text() == "9876"
     assert b"".join(response.response) == b"fragment"
     assert process.terminated
@@ -1615,7 +1616,8 @@ def test_video_transcode_streams_mythtv_video_as_mp4(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert response.content_type == "video/mp4"
     assert commands[0][commands[0].index("-ss") + 1] == "12.5"
-    assert commands[0][commands[0].index("-re") + 1] == "-i"
+    assert commands[0][commands[0].index("-readrate") + 1] == "2"
+    assert commands[0][commands[0].index("-readrate_initial_burst") + 1] == "2"
     assert commands[0][commands[0].index("-i") + 1] == (
         "http://127.0.0.1:6544/Content/GetVideo?Id=16509"
     )

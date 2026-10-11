@@ -2,10 +2,12 @@ import fcntl
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
@@ -31,6 +33,9 @@ PRIMARY_RECORDING_GROUP = "Seasons"
 ACTIVE_RECORDING_GROUPS = {"Default", PRIMARY_RECORDING_GROUP}
 RECORDINGS_PAGE_SIZE = 5000
 RECORDINGS_CACHE_SECONDS = 120
+TRANSCODE_READ_RATE = 2
+TRANSCODE_OUTPUT_CHUNK_BYTES = 64 * 1024
+TRANSCODE_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
 RECORDING_RULE_FIELDS = (
     "Title",
     "SubTitle",
@@ -245,7 +250,10 @@ def _start_transcode(
         "error",
         "-ss",
         str(start),
-        "-re",
+        "-readrate",
+        str(TRANSCODE_READ_RATE),
+        "-readrate_initial_burst",
+        "2",
         "-i",
         source_url,
         "-map",
@@ -280,12 +288,37 @@ def _start_transcode(
         app.logger.warning("Could not start FFmpeg: %s", error)
         return jsonify(error="Could not start FFmpeg"), 502
     process_path.write_text(str(process.pid))
+    output_queue = queue.Queue(
+        maxsize=TRANSCODE_OUTPUT_BUFFER_BYTES // TRANSCODE_OUTPUT_CHUNK_BYTES
+    )
+    stop_output = threading.Event()
+    finished = object()
+
+    def fill_output_buffer():
+        try:
+            while chunk := process.stdout.read1(TRANSCODE_OUTPUT_CHUNK_BYTES):
+                while not stop_output.is_set():
+                    try:
+                        output_queue.put(chunk, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop_output.is_set():
+                try:
+                    output_queue.put(finished, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
 
     def generate():
+        output_thread = threading.Thread(target=fill_output_buffer, daemon=True)
+        output_thread.start()
         try:
-            while chunk := process.stdout.read1(64 * 1024):
+            while (chunk := output_queue.get()) is not finished:
                 yield chunk
         finally:
+            stop_output.set()
             process.terminate()
             try:
                 process.wait(timeout=3)
@@ -293,6 +326,7 @@ def _start_transcode(
                 process.kill()
                 process.wait()
             process_path.unlink(missing_ok=True)
+            output_thread.join(timeout=3)
 
     return Response(
         stream_with_context(generate()),
