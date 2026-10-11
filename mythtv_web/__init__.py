@@ -245,6 +245,7 @@ def _start_transcode(
         "error",
         "-ss",
         str(start),
+        "-re",
         "-i",
         source_url,
         "-map",
