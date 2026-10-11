@@ -2,9 +2,11 @@ import fcntl
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from functools import lru_cache
@@ -32,6 +34,9 @@ from .transcodes import CapacityError, TokenActiveError, TranscodeRegistry
 DEFAULT_BACKEND_URL = "http://127.0.0.1:6544"
 PRIMARY_RECORDING_GROUP = "Seasons"
 ACTIVE_RECORDING_GROUPS = {"Default", PRIMARY_RECORDING_GROUP}
+TRANSCODE_READ_RATE = 2
+TRANSCODE_OUTPUT_CHUNK_BYTES = 64 * 1024
+TRANSCODE_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
 RECORDING_RULE_FIELDS = (
     "Title",
     "SubTitle",
@@ -236,7 +241,10 @@ def _start_transcode(
         threads,
         "-ss",
         str(start),
-        "-re",
+        "-readrate",
+        str(TRANSCODE_READ_RATE),
+        "-readrate_initial_burst",
+        "2",
         "-i",
         source_url,
         "-map",
@@ -280,13 +288,41 @@ def _start_transcode(
     except OSError as error:
         app.logger.warning("Could not start FFmpeg: %s", error)
         return jsonify(error="Could not start FFmpeg"), 502
+    output_queue = queue.Queue(
+        maxsize=TRANSCODE_OUTPUT_BUFFER_BYTES // TRANSCODE_OUTPUT_CHUNK_BYTES
+    )
+    stop_output = threading.Event()
+    finished = object()
+
+    def fill_output_buffer():
+        try:
+            while chunk := job.process.stdout.read1(TRANSCODE_OUTPUT_CHUNK_BYTES):
+                while not stop_output.is_set():
+                    try:
+                        output_queue.put(chunk, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop_output.is_set():
+                try:
+                    output_queue.put(finished, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
 
     def generate():
+        output_thread = threading.Thread(target=fill_output_buffer, daemon=True)
+        output_thread.start()
         try:
-            while chunk := job.process.stdout.read1(64 * 1024):
+            while (chunk := output_queue.get()) is not finished:
                 yield chunk
         finally:
-            job.close()
+            stop_output.set()
+            try:
+                job.close()
+            finally:
+                output_thread.join(timeout=3)
 
     response = Response(
         stream_with_context(generate()),
@@ -1666,77 +1702,9 @@ def create_app(config: dict | None = None) -> Flask:
             return jsonify(error="Invalid playback start position"), 400
         if not re.fullmatch(r"[a-f0-9]{32}", token):
             return jsonify(error="A valid transcode token is required"), 400
-        threads = str(app.config["MYTHTV_FFMPEG_THREADS"])
-        command = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-threads",
-            threads,
-            "-filter_threads",
-            threads,
-            "-ss",
-            str(start),
-            "-re",
-            "-i",
-            _recording_url(app, recorded_id),
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-threads:v",
-            threads,
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-threads:a",
-            threads,
-            "-b:a",
-            "160k",
-            "-movflags",
-            "+frag_keyframe+empty_moov+default_base_moof",
-            "-f",
-            "mp4",
-            "pipe:1",
-        ]
-        registry = TranscodeRegistry(
-            app.config["MYTHTV_TRANSCODE_DIR"], app.config["MYTHTV_MAX_TRANSCODES"]
+        return _start_transcode(
+            app, ffmpeg, _recording_url(app, recorded_id), start, token, recorded_id
         )
-        try:
-            job = registry.start(command, token, recorded_id, g.current_user)
-        except TokenActiveError:
-            return jsonify(error="Transcode token is already active"), 409
-        except CapacityError:
-            return (
-                jsonify(error="All transcode slots are busy. Try again shortly."),
-                503,
-            )
-        except OSError as error:
-            app.logger.warning("Could not start FFmpeg: %s", error)
-            return jsonify(error="Could not start FFmpeg"), 502
-
-        def generate():
-            try:
-                while chunk := job.process.stdout.read1(64 * 1024):
-                    yield chunk
-            finally:
-                job.close()
-
-        response = Response(
-            stream_with_context(generate()),
-            content_type="video/mp4",
-            headers={"Cache-Control": "no-store"},
-        )
-        response.call_on_close(job.close)
-        return response
 
     @app.post("/api/playback/<int:recorded_id>/transcode/cancel")
     def cancel_playback_transcode(recorded_id):
