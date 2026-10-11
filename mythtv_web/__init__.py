@@ -282,7 +282,6 @@ def _start_transcode(
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
         )
     except OSError as error:
         app.logger.warning("Could not start FFmpeg: %s", error)
@@ -314,19 +313,28 @@ def _start_transcode(
     def generate():
         output_thread = threading.Thread(target=fill_output_buffer, daemon=True)
         output_thread.start()
+        completed = False
         try:
-            while (chunk := output_queue.get()) is not finished:
+            while True:
+                chunk = output_queue.get()
+                if chunk is finished:
+                    completed = True
+                    break
                 yield chunk
         finally:
             stop_output.set()
             process.terminate()
             try:
-                process.wait(timeout=3)
+                exit_code = process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
+                exit_code = process.wait()
             process_path.unlink(missing_ok=True)
             output_thread.join(timeout=3)
+            if completed and exit_code:
+                app.logger.error(
+                    "FFmpeg transcode %s ended with exit code %s", token, exit_code
+                )
 
     return Response(
         stream_with_context(generate()),
