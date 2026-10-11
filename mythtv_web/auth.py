@@ -70,17 +70,16 @@ def _load_user(user_id: int) -> dict | None:
 
 def _get_secret_key(app) -> str:
     configured_key = app.config.get("SECRET_KEY")
-    if configured_key:
-        return configured_key
-
     key_path = Path(app.config["AUTH_DATABASE_PATH"]).parent / "flask-secret-key"
     key_path.parent.mkdir(parents=True, exist_ok=True)
     with key_path.open("a+", encoding="utf-8") as key_file:
         fcntl.flock(key_file, fcntl.LOCK_EX)
         key_file.seek(0)
-        key = key_file.read().strip()
+        stored_key = key_file.read().strip()
+        key = configured_key or stored_key
         if not key:
             key = secrets.token_hex(32)
+        if key != stored_key:
             key_file.seek(0)
             key_file.write(key)
             key_file.truncate()
@@ -175,6 +174,14 @@ def init_auth(app) -> None:
                     supplied_token.encode(), expected_token.encode()
                 )
             ):
+                if endpoint == "auth.login":
+                    return redirect(
+                        url_for(
+                            "auth.login",
+                            next=request.form.get("next"),
+                            csrf="expired",
+                        )
+                    )
                 abort(400, "Invalid CSRF token")
 
         if endpoint in {"static", "healthz", "auth.login"}:
@@ -205,6 +212,13 @@ def init_auth(app) -> None:
             return token
 
         return {"current_user": g.get("current_user"), "csrf_token": csrf_token}
+
+    @app.after_request
+    def prevent_login_form_caching(response):
+        if request.endpoint == "auth.login":
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        return response
 
 
 def _valid_password(password: str) -> bool:
@@ -260,7 +274,12 @@ def login():
             }:
                 destination = url_for("index")
             return redirect(destination)
-        return render_template("login.html", next_url=next_url, error=None)
+        error = (
+            "Your sign-in form expired. Please enter your details again."
+            if request.args.get("csrf") == "expired"
+            else None
+        )
+        return render_template("login.html", next_url=next_url, error=error)
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
@@ -286,7 +305,10 @@ def login():
     session["csrf_token"] = secrets.token_urlsafe(32)
     if user["must_change_password"]:
         return redirect(url_for("auth.change_password"))
-    return redirect(_safe_next_url(next_url) or url_for("index"))
+    destination = _safe_next_url(next_url)
+    if destination is None or urlsplit(destination).path == "/":
+        destination = url_for("index")
+    return redirect(destination)
 
 
 @auth.post("/logout")

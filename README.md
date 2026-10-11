@@ -30,6 +30,10 @@ The home page groups recordings by program title, like MythFrontend. Selecting a
 
 Each worker keeps a parsed copy of the recordings cache and checks the file's inode, modification time, and size before reusing it. Fresh reads avoid the shared refresh lock; deletion invalidates the disk cache so all workers notice the change on their next lookup.
 
+## Videos library
+
+The Videos tab lists MythTV video-library entries from `Video/GetVideoList`, with search, watched-state filters, artwork, and browser playback. If artwork is missing or its file is unavailable, Flask generates and caches a poster frame from `Content/GetVideo`; this fallback requires system `ffmpeg`. Video streams are served through Flask, and watched status updates use `Video/UpdateVideoWatchedStatus`. MythTV service URLs remain server-side.
+
 ## Guide and backend status
 
 The Upcoming tab shows scheduled programs, while Guide browses a four-hour program window and can create, edit, or delete recording rules through MythTV's `Dvr` services. These actions require a Flask account session, but Flask does not pass account identity to MythTV. Guest accounts can create and edit rules but cannot delete rules or recordings. Apache protects public access, and the host firewall must restrict direct Flask access. Status summarizes backend version, connected encoders, and encoder state. Live TV lists programs currently airing on visible channels and offers the same schedule action; it does not start live playback because MythTV's HTTP services on this host do not expose a tuner-start or live-channel stream endpoint.
@@ -38,7 +42,7 @@ The Upcoming tab shows scheduled programs, while Guide browses a four-hour progr
 
 The Flask app requires sign-in for the library and API; `/healthz` remains public. Accounts are stored in `.run/users.sqlite` with Werkzeug password hashes. On an empty account database, the app creates the initial administrator `admin` with password `mythtv-admin`; that account must change its password at first sign-in. Override the initial account before the first start with `MYTHTV_INITIAL_ADMIN_USERNAME` and `MYTHTV_INITIAL_ADMIN_PASSWORD`. The password setting is only used when the database has no users; it does not reset existing credentials. New accounts are also required to change their initial password. Admins manage users, roles, and passwords at `/admin/users`; supported roles are `admin`, `user`, and `guest`. Guest accounts otherwise behave like users but cannot delete recordings or recording rules.
 
-`MYTHTV_AUTH_DATABASE` selects another account database path. Authentication cookies are persistent for 365 days by default and refresh while the user is active; set `MYTHTV_SESSION_LIFETIME_DAYS` to choose another lifetime. Flask creates and persists a random session-signing key under `.run/` by default; set `MYTHTV_SECRET_KEY` to supply a stable key explicitly, and keep it private. Set `MYTHTV_SESSION_COOKIE_SECURE=1` when all browser access uses HTTPS. For deployments using the known initial password, change it immediately on first sign-in; preferably set a unique `MYTHTV_INITIAL_ADMIN_PASSWORD` before the first start.
+`MYTHTV_AUTH_DATABASE` selects another account database path. Authentication cookies are persistent for 365 days by default and refresh while the user is active; set `MYTHTV_SESSION_LIFETIME_DAYS` to choose another lifetime. Flask creates and persists a random session-signing key under `.run/` by default; set `MYTHTV_SECRET_KEY` to supply a stable key explicitly, and keep it private. The selected key is persisted beside the account database so sessions survive restarts even if the environment variable is omitted later; changing the key signs out existing sessions. Set `MYTHTV_SESSION_COOKIE_SECURE=1` when all browser access uses HTTPS. For deployments using the known initial password, change it immediately on first sign-in; preferably set a unique `MYTHTV_INITIAL_ADMIN_PASSWORD` before the first start.
 
 Existing account databases are migrated automatically on startup. The session-security upgrade requires existing users to sign in again. Password changes revoke other sessions while keeping the changing user's current session; administrator password resets revoke all sessions for the affected account. Session cookies use `SameSite=Strict` by default.
 
@@ -116,7 +120,7 @@ The launcher requires dependencies to be installed in `.venv/`. It only stops th
 
 ## Apache reverse proxy
 
-The example Apache snippet is [`config/apache/mythtv-web.conf`](config/apache/mythtv-web.conf). It serves the app at `https://mythtv.example.com/mythtv-web/` and redirects HTTP to HTTPS. Authentication is handled by the Flask app; Apache does not add a second login prompt. Replace `mythtv.example.com` in the snippet with the canonical DNS name covered by your HTTPS certificate. The Flask/Gunicorn service binds to all interfaces on port 6555; Apache forwards the `/mythtv-web/` prefix so the page's static files and API requests use the same path.
+The example Apache snippet is [`config/apache/mythtv-web.conf`](config/apache/mythtv-web.conf). It serves the app at `https://mythtv.example.com/mythtv-web/` and redirects HTTP to HTTPS. Authentication is handled by the Flask app; Apache does not add a second login prompt. Replace `mythtv.example.com` in the snippet with the canonical DNS name covered by your HTTPS certificate. The Flask/Gunicorn service binds to all interfaces on port 6555; Apache forwards the `/mythtv-web/` prefix so the page's static files and API requests use the same path. The Apache snippet includes `ProxyPassReverseCookiePath / /mythtv-web/` to scope Flask's session cookie to this application path.
 
 On Debian or Ubuntu, install the snippet as root:
 
@@ -145,7 +149,7 @@ An unauthenticated browser request should redirect to the Flask login page; unau
 
 ## Nginx reverse proxy
 
-Nginx can serve the same `/mythtv-web/` URL prefix. Add a port 80 redirect and the following locations to the site's HTTPS `server` block, replacing the hostname and certificate paths with your own:
+Nginx can serve the same `/mythtv-web/` URL prefix. Add a port 80 redirect and the following locations to the site's HTTPS `server` block, replacing the hostname and certificate paths with your own. Apply the session-cookie path rewrite in the reverse proxy that directly fronts Flask: use this Nginx directive when Nginx is that proxy, or Apache's `ProxyPassReverseCookiePath` above when Apache is; do not configure both for the same response.
 
 ```nginx
 server {
@@ -166,6 +170,7 @@ server {
 
 	location /mythtv-web/ {
 		proxy_pass http://127.0.0.1:6555/;
+		proxy_cookie_path / /mythtv-web/;
 		proxy_http_version 1.1;
 		proxy_set_header Host $host;
 		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

@@ -93,6 +93,39 @@ def test_initial_admin_must_change_password_and_anonymous_routes_are_restricted(
     assert client.get("/admin/users").status_code == 200
 
 
+def test_configured_secret_key_survives_restart_without_environment_key(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("MYTHTV_SECRET_KEY", raising=False)
+    database_path = tmp_path / "users.sqlite"
+    configured_key = "stable-configured-test-key"
+    first_app = create_app(
+        {
+            "AUTH_DATABASE_PATH": str(database_path),
+            "SECRET_KEY": configured_key,
+            "INITIAL_ADMIN_PASSWORD": INITIAL_PASSWORD,
+        }
+    )
+    first_client = first_app.test_client()
+    response = login(first_client, "admin", INITIAL_PASSWORD)
+    session_cookie = first_client.get_cookie("session")
+
+    assert response.location.endswith("/change-password")
+    assert session_cookie is not None
+    assert (tmp_path / "flask-secret-key").read_text() == configured_key
+
+    restarted_app = create_app(
+        {
+            "AUTH_DATABASE_PATH": str(database_path),
+            "INITIAL_ADMIN_PASSWORD": INITIAL_PASSWORD,
+        }
+    )
+    restarted_client = restarted_app.test_client()
+    restarted_client.set_cookie("session", session_cookie.value)
+
+    assert restarted_client.get("/").location.endswith("/change-password")
+
+
 def test_users_page_has_back_to_library_link(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()
@@ -113,7 +146,7 @@ def test_login_requires_a_nonempty_csrf_token_and_sets_samesite(tmp_path):
         client.post(
             "/login", data={"username": "admin", "password": INITIAL_PASSWORD}
         ).status_code
-        == 400
+        == 302
     )
     page = client.get("/login")
     assert "SameSite=Strict" in page.headers["Set-Cookie"]
@@ -121,9 +154,9 @@ def test_login_requires_a_nonempty_csrf_token_and_sets_samesite(tmp_path):
         client.post(
             "/login", data={"username": "admin", "password": INITIAL_PASSWORD}
         ).status_code
-        == 400
+        == 302
     )
-    assert client.post("/login", data={"csrf_token": "invalid-☃"}).status_code == 400
+    assert client.post("/login", data={"csrf_token": "invalid-☃"}).status_code == 302
     assert login(client, "admin", INITIAL_PASSWORD).status_code == 302
 
 
@@ -247,6 +280,62 @@ def test_authenticated_browser_back_from_library_skips_login_form(tmp_path):
     assert back_response.status_code == 302
     assert back_response.location == "/"
     assert client.get(back_response.location).status_code == 200
+
+
+def test_login_root_destination_stays_inside_forwarded_prefix(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    prefix_headers = {"X-Forwarded-Prefix": "/mythtv-web"}
+    with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
+        connection.execute("UPDATE users SET must_change_password = 0")
+
+    login_page = client.get("/login?next=/%3F", headers=prefix_headers)
+    response = client.post(
+        "/login",
+        headers=prefix_headers,
+        data={
+            "csrf_token": csrf_token(login_page),
+            "username": "admin",
+            "password": INITIAL_PASSWORD,
+            "next": "/?",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.location == "/mythtv-web/"
+
+
+def test_stale_login_csrf_refreshes_form_without_accepting_submission(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    login_page = client.get("/login")
+    assert login_page.headers["Cache-Control"] == "no-store"
+    rejected = client.post(
+        "/login",
+        data={
+            "csrf_token": "stale-token",
+            "username": "admin",
+            "password": INITIAL_PASSWORD,
+        },
+    )
+
+    assert rejected.status_code == 302
+    refreshed = client.get(rejected.location)
+    assert refreshed.status_code == 200
+    assert b"Your sign-in form expired" in refreshed.data
+    assert csrf_token(refreshed) != "stale-token"
+
+    response = client.post(
+        "/login",
+        data={
+            "csrf_token": csrf_token(refreshed),
+            "username": "admin",
+            "password": INITIAL_PASSWORD,
+        },
+    )
+    assert response.status_code == 302
+    assert response.location.endswith("/change-password")
 
 
 def test_admin_manages_accounts_and_regular_users_cannot_manage_users(tmp_path):
