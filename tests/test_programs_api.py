@@ -1290,8 +1290,9 @@ def test_transcode_cancel_terminates_only_a_tokenized_process(monkeypatch, tmp_p
     assert invalid_response.status_code == 400
 
 
+@pytest.mark.parametrize("subtitle", [None, "3"])
 def test_transcode_stream_removes_process_registration_after_completion(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, subtitle
 ):
     programs = [
         {
@@ -1322,6 +1323,10 @@ def test_transcode_stream_removes_process_registration_after_completion(
         def wait(self, timeout=None):
             return 0
 
+    monkeypatch.setattr(
+        "mythtv_web._probe_recording",
+        lambda *_: {"subtitles": [{"index": 3, "codec": "dvb_subtitle"}]},
+    )
     process = Process()
     commands = []
 
@@ -1336,12 +1341,27 @@ def test_transcode_stream_removes_process_registration_after_completion(
     app.config["MYTHTV_TRANSCODE_DIR"] = str(tmp_path / "transcodes")
 
     response = app.test_client().get(
-        f"/api/playback/42/transcode?start=123.5&token={token}", buffered=False
+        f"/api/playback/42/transcode?start=123.5&token={token}"
+        + (f"&subtitle={subtitle}" if subtitle is not None else ""),
+        buffered=False,
     )
     process_path = tmp_path / "transcodes" / f"{token}.pid"
 
     assert response.status_code == 200
     assert commands[0][commands[0].index("-ss") + 1] == "123.5"
+    if subtitle is not None:
+        assert commands[0][commands[0].index("-filter_complex") + 1] == (
+            "[0:v:0][0:3]overlay=eof_action=pass[v]"
+        )
+        assert commands[0][commands[0].index("-filter_complex_threads") + 1] == "2"
+    else:
+        assert "-filter_complex" not in commands[0]
+    for invalid in ("-1", "3;evil", "4"):
+        rejected = app.test_client().get(
+            f"/api/playback/42/transcode?token={'c' * 32}&subtitle={invalid}"
+        )
+        assert rejected.status_code in (400, 404)
+    assert len(commands) == 1
     assert process_path.read_text() == "9876"
     assert b"".join(response.response) == b"fragment"
     assert process.terminated

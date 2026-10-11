@@ -1227,6 +1227,30 @@ def create_app(config: dict | None = None) -> Flask:
         if process_path.exists():
             return jsonify(error="Transcode token is already active"), 409
 
+        subtitle = request.args.get("subtitle")
+        subtitle_index = None
+        if subtitle is not None:
+            if len(subtitle) > 10 or not subtitle.isascii() or not subtitle.isdecimal():
+                return jsonify(error="Invalid subtitle track"), 400
+            subtitle_index = int(subtitle)
+            tracks = _probe_recording(app, recorded_id)["subtitles"]
+            if not any(
+                track["index"] == subtitle_index
+                and track.get("codec") == "dvb_subtitle"
+                for track in tracks
+            ):
+                return jsonify(error="DVB subtitle track not found"), 404
+        threads = "2"
+        video_options = ["-map", "0:v:0?"]
+        if subtitle_index is not None:
+            video_options = [
+                "-filter_complex_threads",
+                threads,
+                "-filter_complex",
+                f"[0:v:0][0:{subtitle_index}]overlay=eof_action=pass[v]",
+                "-map",
+                "[v]",
+            ]
         command = [
             ffmpeg,
             "-hide_banner",
@@ -1236,8 +1260,7 @@ def create_app(config: dict | None = None) -> Flask:
             str(start),
             "-i",
             _recording_url(app, recorded_id),
-            "-map",
-            "0:v:0?",
+            *video_options,
             "-map",
             "0:a:0?",
             "-c:v",

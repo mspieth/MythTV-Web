@@ -20,6 +20,7 @@ This project is a Python web server that provides a browser-based interface to t
 12. Group recorded programs by title and show every recording in a selected group, consistent with MythFrontend's recordings workflow.
 13. Require explicit confirmation for recording-file deletion and never force-delete recordings by default. Public access is controlled by Apache and direct internal access by the host firewall; all application actions also require a Flask account session. Schedule-rule create, edit, and delete actions are available to authenticated admins and users; guests may create and edit rules but cannot delete rules or recordings. Rule deletion still requires explicit confirmation.
 14. Require Flask session authentication for application pages and APIs, except `/healthz` and static assets. Support only the `admin`, `user`, and `guest` roles; guest accounts otherwise have user permissions but cannot delete recordings or recording rules. Administrators manage accounts, roles, and passwords. Bootstrap the first admin as `admin` / `mythtv-admin` unless overridden before the first start, and require a password change on first sign-in.
+15. Burn selected DVB bitmap subtitles into server-transcoded video; validate the requested stream against the recording subtitle metadata.
 
 ## Development Guidance
 

@@ -42,6 +42,7 @@ let transcodeBase = 0;
 let transcodeToken = null;
 let wasmPlayback = null;
 let subtitleElement = null;
+let burnedSubtitle = null;
 let lastSavedPosition = -1;
 let requestedStartPosition = 0;
 let smartSkipBusy = false;
@@ -270,7 +271,13 @@ function startTranscode(seconds = 0) {
     playerVideo.playbackRate = playbackRate;
     if ("preservesPitch" in playerVideo) playerVideo.preservesPitch = true;
   });
-  playerVideo.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/transcode?start=${encodeURIComponent(seconds)}&token=${transcodeToken}`);
+  const selectedSubtitle = document.querySelector("#subtitle-track").value;
+  const dvbTrack = playbackInfo?.media.subtitles.find(
+    (track) => String(track.index) === selectedSubtitle && track.codec === "dvb_subtitle",
+  );
+  burnedSubtitle = dvbTrack ? String(dvbTrack.index) : null;
+  const subtitleQuery = burnedSubtitle === null ? "" : `&subtitle=${burnedSubtitle}`;
+  playerVideo.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/transcode?start=${encodeURIComponent(seconds)}&token=${transcodeToken}${subtitleQuery}`);
   playerVideo.load();
   playerVideo.play().catch(() => {
     playerStatus.textContent = "Stream ready. Press Play to begin.";
@@ -293,7 +300,14 @@ function handleVideoError() {
 async function selectSubtitle(streamIndex) {
   subtitleElement?.remove();
   subtitleElement = null;
-  if (streamIndex === "" || !activeRecording) return;
+  if (!activeRecording) return;
+  const selectedTrack = playbackInfo.media.subtitles.find(
+    (track) => String(track.index) === streamIndex,
+  );
+  if (selectedTrack?.codec === "dvb_subtitle" || burnedSubtitle !== null) {
+    startTranscode(Math.max(playbackPosition(), requestedStartPosition));
+  }
+  if (streamIndex === "" || selectedTrack?.codec === "dvb_subtitle") return;
   const trackInfo = playbackInfo.media.subtitles.find(
     (track) => String(track.index) === streamIndex,
   );
@@ -381,6 +395,7 @@ async function openPlayer(program, startMode = "resume") {
   usingTranscode = false;
   usingWasm = false;
   transcodeBase = 0;
+  burnedSubtitle = null;
   stopWasmPlayback();
   lastSavedPosition = -1;
   document.querySelector("#player-title").textContent = program.SubTitle || program.Title;
@@ -503,6 +518,7 @@ async function closePlayer() {
   usingTranscode = false;
   usingWasm = false;
   transcodeBase = 0;
+  burnedSubtitle = null;
   requestedStartPosition = 0;
   if (playerDialog.open) playerDialog.close();
   const returnFocus = playerReturnFocus;
