@@ -17,15 +17,28 @@ class SubtitleCache:
         self.keep = keep
 
     @staticmethod
-    def _extract(app, ffmpeg: str, source_url: str, stream_index: int) -> bytes | None:
-        result = subprocess.run(
+    def _extract(
+        app,
+        ffmpeg: str,
+        source_url: str,
+        stream_index: int,
+        start: float = 0,
+        codec: str | None = None,
+    ) -> bytes | None:
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            str(app.config["MYTHTV_FFMPEG_THREADS"]),
+        ]
+        if start > 0:
+            command.extend(["-ss", str(start)])
+        if codec == "dvb_teletext":
+            command.extend(["-fix_sub_duration", "-txt_format", "text"])
+        command.extend(
             [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-threads",
-                str(app.config["MYTHTV_FFMPEG_THREADS"]),
                 "-i",
                 source_url,
                 "-map",
@@ -33,7 +46,10 @@ class SubtitleCache:
                 "-f",
                 "webvtt",
                 "pipe:1",
-            ],
+            ]
+        )
+        result = subprocess.run(
+            command,
             capture_output=True,
             timeout=120,
             check=False,
@@ -57,6 +73,8 @@ class SubtitleCache:
         stream_index: int,
         ffmpeg: str,
         source_url: str,
+        start: float = 0,
+        codec: str | None = None,
     ) -> bytes | None:
         recording = program.get("Recording") or {}
         if str(recording.get("StatusName", "")).casefold() == "recording":
@@ -65,6 +83,8 @@ class SubtitleCache:
             "source": source_url,
             "recorded_id": recorded_id,
             "stream": stream_index,
+            "offset": start,
+            "codec": codec,
             "filename": recording.get("FileName") or program.get("FileName"),
             "size": recording.get("FileSize") or program.get("FileSize"),
             "modified": recording.get("LastModified"),
@@ -86,7 +106,9 @@ class SubtitleCache:
             cached = self._read(path)
             if cached is not None:
                 return cached
-            contents = self._extract(app, ffmpeg, source_url, stream_index)
+            contents = self._extract(
+                app, ffmpeg, source_url, stream_index, start, codec
+            )
             if contents is None:
                 return None
             temporary = None

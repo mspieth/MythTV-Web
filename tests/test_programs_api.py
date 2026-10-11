@@ -45,13 +45,233 @@ def test_home_renders_recordings_library():
     assert b"/static/mythtv.png" in response.data
     assert all(
         f'data-view="{view}"'.encode() in response.data
-        for view in ("recordings", "live", "upcoming", "guide", "status")
+        for view in ("recordings", "videos", "live", "upcoming", "guide", "status")
     )
     assert b"/static/build/library.js" in response.data
     assert b"browser-wasm-test" not in response.data
     assert b"browser-wasm-stream" not in response.data
     assert response.headers["Cross-Origin-Opener-Policy"] == "same-origin"
     assert response.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
+
+
+def test_videos_are_proxied_from_mythtv_video_service(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "VideoMetadataInfoList": {
+                    "VideoMetadataInfos": [{"Id": 17, "Title": "Local film"}],
+                    "TotalAvailable": 1,
+                    "AsOf": "2026-10-11T00:00:00Z",
+                }
+            }
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr("mythtv_web.requests.get", fake_get)
+    response = create_app().test_client().get("/api/videos")
+
+    assert response.status_code == 200
+    assert response.json["videos"] == [{"Id": 17, "Title": "Local film"}]
+    assert response.json["total"] == 1
+    assert captured["url"] == "http://127.0.0.1:6544/Video/GetVideoList"
+    assert captured["params"] == {
+        "Sort": "title",
+        "StartIndex": 0,
+        "Count": 0,
+        "CollapseSubDirs": "false",
+    }
+
+
+def test_video_stream_forwards_byte_range_to_mythtv(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 206
+        headers = {
+            "Content-Type": "video/mp4",
+            "Content-Length": "4",
+            "Content-Range": "bytes 0-3/8",
+            "Accept-Ranges": "bytes",
+        }
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            assert chunk_size == 64 * 1024
+            yield b"test"
+
+        def close(self):
+            pass
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr("mythtv_web.requests.get", fake_get)
+    response = (
+        create_app()
+        .test_client()
+        .get("/api/videos/17/stream", headers={"Range": "bytes=0-3"})
+    )
+
+    assert response.status_code == 206
+    assert response.data == b"test"
+    assert response.headers["Content-Range"] == "bytes 0-3/8"
+    assert captured["url"] == "http://127.0.0.1:6544/Content/GetVideo"
+    assert captured["params"] == {"Id": 17}
+    assert captured["headers"] == {"Range": "bytes=0-3"}
+    assert captured["stream"] is True
+
+
+def test_video_playback_info_converts_mythtv_frames_to_seconds(monkeypatch):
+    requested = []
+
+    class Response:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"long": str(self.frames)}
+
+    def fake_get(url, **kwargs):
+        requested.append((url, kwargs))
+        return Response(750 if url.endswith("GetSavedBookmark") else 1500)
+
+    monkeypatch.setattr("mythtv_web.requests.get", fake_get)
+    monkeypatch.setattr(
+        "mythtv_web._probe_video",
+        lambda _app, _video_id: {
+            "frame_rate": 25.0,
+            "duration": 120.0,
+            "subtitles": [{"index": 2, "language": "eng", "title": "English"}],
+        },
+    )
+
+    response = create_app().test_client().get("/api/videos/17/playback")
+
+    assert response.status_code == 200
+    assert response.json == {
+        "duration": 120.0,
+        "frame_rate": 25.0,
+        "last_position": 60.0,
+        "bookmark": 30.0,
+        "subtitles": [{"index": 2, "language": "eng", "title": "English"}],
+    }
+    assert [call[0].rsplit("/", 1)[-1] for call in requested] == [
+        "GetSavedBookmark",
+        "GetLastPlayPos",
+    ]
+
+
+def test_video_position_saves_seconds_as_mythtv_frames(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"bool": True}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr("mythtv_web.requests.post", fake_post)
+    monkeypatch.setattr(
+        "mythtv_web._probe_video",
+        lambda _app, _video_id: {"frame_rate": 25.0},
+    )
+
+    response = (
+        create_app()
+        .test_client()
+        .post("/api/videos/17/position", json={"position": 45.5})
+    )
+
+    assert response.status_code == 200
+    assert response.json == {"saved": True}
+    assert captured["url"] == "http://127.0.0.1:6544/Video/SetLastPlayPos"
+    assert captured["params"] == {"Id": 17, "Offset": 1138}
+
+
+def test_video_preview_extracts_and_caches_thumbnail(monkeypatch, tmp_path):
+    app = create_app({"MYTHTV_VIDEO_THUMBNAIL_DIR": str(tmp_path)})
+    captured = []
+
+    monkeypatch.setattr("mythtv_web.shutil.which", lambda command: "/usr/bin/ffmpeg")
+
+    def fake_run(command, **kwargs):
+        captured.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout=b"jpeg-thumbnail")
+
+    monkeypatch.setattr("mythtv_web.subprocess.run", fake_run)
+    client = app.test_client()
+
+    response = client.get("/api/video-preview/31390")
+    cached_response = client.get("/api/video-preview/31390")
+
+    assert response.status_code == 200
+    assert response.mimetype == "image/jpeg"
+    assert response.data == b"jpeg-thumbnail"
+    assert response.headers["Cache-Control"] == "public, max-age=86400"
+    assert cached_response.data == b"jpeg-thumbnail"
+    assert len(captured) == 1
+    assert "http://127.0.0.1:6544/Content/GetVideo?Id=31390" in captured[0][0]
+    assert captured[0][0][captured[0][0].index("-ss") + 1] == "15"
+
+
+def test_video_preview_rejects_zero_id_without_running_ffmpeg(monkeypatch):
+    monkeypatch.setattr(
+        "mythtv_web.shutil.which",
+        lambda command: (_ for _ in ()).throw(AssertionError("ffmpeg should not run")),
+    )
+
+    response = create_app().test_client().get("/api/video-preview/0")
+
+    assert response.status_code == 400
+
+
+def test_video_watched_status_uses_mythtv_video_service(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"bool": True}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr("mythtv_web.requests.post", fake_post)
+    response = (
+        create_app()
+        .test_client()
+        .post("/api/videos/17/watched", json={"watched": True})
+    )
+
+    assert response.status_code == 200
+    assert response.json == {"watched": True}
+    assert captured["url"] == ("http://127.0.0.1:6544/Video/UpdateVideoWatchedStatus")
+    assert captured["json"] == {"Id": 17, "Watched": True}
 
 
 def test_home_uses_forwarded_prefix_for_assets_and_navigation():
@@ -72,9 +292,16 @@ def test_home_includes_accessible_fullscreen_playback_controls():
     response = create_app().test_client().get("/")
 
     assert response.status_code == 200
+    assert b'data-video-mode="all"' in response.data
+    assert b'data-video-mode="folders"' in response.data
+    assert b'id="video-breadcrumb"' in response.data
     assert b'id="jump-back-ten-minutes"' in response.data
     assert b'id="jump-forward-ten-minutes"' in response.data
     assert b'id="player-toggle"' in response.data
+    assert b'id="player-mute"' in response.data
+    assert b'aria-label="Mute"' in response.data
+    assert b'id="player-volume" type="range"' in response.data
+    assert b'aria-label="Volume"' in response.data
     assert b'id="player-record-program"' not in response.data
     assert (
         b'id="skip-ad"' in response.data
@@ -1377,7 +1604,76 @@ def test_transcode_stream_removes_process_registration_after_completion(
     assert not process_path.exists()
 
 
-def test_subtitle_endpoint_extracts_only_known_subtitle_tracks(monkeypatch, tmp_path):
+def test_video_transcode_streams_mythtv_video_as_mp4(monkeypatch, tmp_path):
+    token = "c" * 32
+
+    class Stdout:
+        chunks = [b"fragment", b""]
+
+        def read1(self, _size):
+            return self.chunks.pop(0)
+
+        def close(self):
+            pass
+
+    class Process:
+        pid = 8765
+        stdout = Stdout()
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    process = Process()
+    commands = []
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr("mythtv_web.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("mythtv_web.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "mythtv_web.transcodes._process_identity", lambda _: {"start": "123"}
+    )
+    app = create_app()
+    app.config["MYTHTV_TRANSCODE_DIR"] = str(tmp_path / "transcodes")
+
+    response = app.test_client().get(
+        f"/api/videos/16509/transcode?start=12.5&token={token}", buffered=False
+    )
+    process_path = tmp_path / "transcodes" / f"{token}.json"
+
+    assert response.status_code == 200
+    assert response.content_type == "video/mp4"
+    assert commands[0][commands[0].index("-ss") + 1] == "12.5"
+    assert commands[0][commands[0].index("-i") + 1] == (
+        "http://127.0.0.1:6544/Content/GetVideo?Id=16509"
+    )
+    assert json.loads(process_path.read_text())["pid"] == 8765
+    assert b"".join(response.response) == b"fragment"
+    assert process.terminated
+    assert not process_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("codec", "start", "expected_decoder_options"),
+    [
+        ("subrip", 0, []),
+        ("subrip", 814.3, ["-ss", "814.3"]),
+        ("dvb_teletext", 0, ["-fix_sub_duration", "-txt_format", "text"]),
+        (
+            "dvb_teletext",
+            814.3,
+            ["-ss", "814.3", "-fix_sub_duration", "-txt_format", "text"],
+        ),
+    ],
+)
+def test_subtitle_endpoint_extracts_only_known_subtitle_tracks(
+    monkeypatch, tmp_path, codec, start, expected_decoder_options
+):
     programs = [
         {
             "Title": "Example series",
@@ -1393,7 +1689,7 @@ def test_subtitle_endpoint_extracts_only_known_subtitle_tracks(monkeypatch, tmp_
             "subtitles": [
                 {
                     "index": 3,
-                    "codec": "subrip",
+                    "codec": codec,
                     "language": "eng",
                     "title": "English",
                 }
@@ -1413,14 +1709,55 @@ def test_subtitle_endpoint_extracts_only_known_subtitle_tracks(monkeypatch, tmp_
     app.config["MYTHTV_RECORDINGS_CACHE_PATH"] = str(cache_path)
     client = app.test_client()
 
-    response = client.get("/api/playback/42/subtitles/3")
+    response = client.get(f"/api/playback/42/subtitles/3?start={start}")
     invalid_response = client.get("/api/playback/42/subtitles/7")
 
     assert response.status_code == 200
     assert response.content_type.startswith("text/vtt")
     assert response.data == b"WEBVTT\n\n"
     assert captured["command"][captured["command"].index("-map") + 1] == "0:3"
+    input_index = captured["command"].index("-i")
+    options_start = captured["command"].index("-threads") + 2
+    assert captured["command"][options_start:input_index] == expected_decoder_options
     assert invalid_response.status_code == 404
+
+
+def test_video_subtitle_endpoint_rebases_teletext_to_transcode_offset(monkeypatch):
+    monkeypatch.setattr("mythtv_web.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        "mythtv_web._probe_video",
+        lambda _app, _video_id: {
+            "subtitles": [
+                {
+                    "index": 2,
+                    "codec": "dvb_teletext",
+                    "language": "eng",
+                    "title": "English",
+                }
+            ]
+        },
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0, b"WEBVTT\n\n", b"")
+
+    monkeypatch.setattr("mythtv_web.subprocess.run", fake_run)
+
+    response = create_app().test_client().get("/api/videos/17/subtitles/2?start=123.4")
+
+    assert response.status_code == 200
+    command = captured["command"]
+    input_index = command.index("-i")
+    assert command[4:input_index] == [
+        "-ss",
+        "123.4",
+        "-fix_sub_duration",
+        "-txt_format",
+        "text",
+    ]
+    assert command[input_index + 1] == ("http://127.0.0.1:6544/Content/GetVideo?Id=17")
 
 
 def test_artwork_proxy_forwards_only_mythtv_image_parameters(monkeypatch):
@@ -1441,7 +1778,10 @@ def test_artwork_proxy_forwards_only_mythtv_image_parameters(monkeypatch):
     monkeypatch.setattr("mythtv_web.requests.get", fake_get)
     app = create_app()
     app.config["MYTHTV_BACKEND_URL"] = "http://backend:6544"
-    image_url = "/Content/GetImageFile?StorageGroup=Coverart&FileName=%2Fcover.jpg"
+    image_url = (
+        "/Content/GetImageFile?StorageGroup=Coverart&FileName="
+        "%2Fhome%2Fmythtv%2F.mythtv%2FMythVideo%2Fcover.jpg"
+    )
     response = app.test_client().get(
         f"/api/artwork?url={image_url.replace('&', '%26')}"
     )
@@ -1451,7 +1791,7 @@ def test_artwork_proxy_forwards_only_mythtv_image_parameters(monkeypatch):
     assert response.content_type == "image/webp"
     assert response.headers["Cache-Control"] == "public, max-age=3600"
     assert captured["url"] == "http://backend:6544/Content/GetImageFile"
-    assert captured["params"] == {"StorageGroup": "Coverart", "FileName": "/cover.jpg"}
+    assert captured["params"] == {"StorageGroup": "Coverart", "FileName": "cover.jpg"}
 
 
 @pytest.mark.parametrize("endpoint", ["position", "bookmark", "transcode/cancel"])
