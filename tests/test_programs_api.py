@@ -1290,6 +1290,39 @@ def test_transcode_cancel_terminates_only_a_tokenized_process(monkeypatch, tmp_p
     assert invalid_response.status_code == 400
 
 
+def test_app_startup_cleans_stale_transcode_pid_files(monkeypatch, tmp_path):
+    transcode_dir = tmp_path / "transcodes"
+    transcode_dir.mkdir()
+    stale_path = transcode_dir / f"{'a' * 32}.pid"
+    other_process_path = transcode_dir / f"{'b' * 32}.pid"
+    active_path = transcode_dir / f"{'c' * 32}.pid"
+    stale_path.write_text("4321")
+    other_process_path.write_text("1234")
+    active_path.write_text("8765")
+
+    def fake_readlink(path):
+        process_id = path.split("/")[2]
+        if process_id == "4321":
+            raise FileNotFoundError
+        if process_id == "1234":
+            return "/usr/bin/python3"
+        if process_id == "8765":
+            return "/usr/bin/ffmpeg"
+        raise AssertionError(f"Unexpected process path: {path}")
+
+    monkeypatch.setattr("mythtv_web.os.readlink", fake_readlink)
+    create_app(
+        {
+            "AUTH_DATABASE_PATH": str(tmp_path / "users.sqlite"),
+            "MYTHTV_TRANSCODE_DIR": str(transcode_dir),
+        }
+    )
+
+    assert not stale_path.exists()
+    assert not other_process_path.exists()
+    assert active_path.exists()
+
+
 def test_transcode_stream_removes_process_registration_after_completion(
     monkeypatch, tmp_path
 ):

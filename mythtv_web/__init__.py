@@ -292,6 +292,33 @@ def _read_frame_offset(
     return round(frames * 1000 / frame_rate) if frame_rate else 0
 
 
+def _is_ffmpeg_process(process_id: int) -> bool:
+    try:
+        executable = Path(os.readlink(f"/proc/{process_id}/exe")).name
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return executable in {"ffmpeg", "ffmpeg (deleted)"}
+
+
+def _cleanup_stale_transcodes(app: Flask) -> None:
+    transcode_dir = Path(app.config["MYTHTV_TRANSCODE_DIR"])
+    for process_path in transcode_dir.glob("*.pid"):
+        try:
+            process_id = int(process_path.read_text())
+        except ValueError:
+            process_path.unlink(missing_ok=True)
+            continue
+        except OSError as error:
+            app.logger.warning(
+                "Could not read FFmpeg registration %s: %s", process_path, error
+            )
+            continue
+        if process_id <= 0 or not _is_ffmpeg_process(process_id):
+            process_path.unlink(missing_ok=True)
+
+
 def _load_all_recordings(app: Flask) -> list[dict]:
     cache_path = Path(app.config["MYTHTV_RECORDINGS_CACHE_PATH"])
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +411,10 @@ def create_app(config: dict | None = None) -> Flask:
     app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=session_lifetime_days)
     if config:
         app.config.update(config)
+    try:
+        _cleanup_stale_transcodes(app)
+    except OSError as error:
+        app.logger.warning("Could not clean stale FFmpeg registrations: %s", error)
     init_auth(app)
 
     @app.get("/")
