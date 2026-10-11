@@ -16,6 +16,7 @@
       </a>
       <nav aria-label="Main navigation">
         <button class="nav-link active" type="button" data-view="recordings" aria-current="page">Recordings</button>
+        <button class="nav-link" type="button" data-view="videos">Videos</button>
         <button class="nav-link" type="button" data-view="live">Live TV</button>
         <button class="nav-link" type="button" data-view="upcoming">Upcoming</button>
         <button class="nav-link" type="button" data-view="guide">Guide</button>
@@ -62,6 +63,41 @@
         <span class="empty-mark" aria-hidden="true">—</span>
         <h2 id="empty-title">No recordings found</h2>
         <p id="empty-description">Try another search or change the watched filter.</p>
+      </div>
+    </main>
+
+    <main class="library-shell" data-view-panel="videos" hidden>
+      <section class="library-heading" aria-labelledby="videos-title">
+        <div>
+          <p class="eyebrow">MythTV Backend <span>/</span> Video Library</p>
+          <h1 id="videos-title">Videos</h1>
+          <p class="library-summary"><strong id="videos-total">--</strong> <span>videos</span></p>
+        </div>
+        <div class="sync-note" id="videos-sync-note" aria-live="polite">Connecting to MythTV…</div>
+      </section>
+      <section class="toolbar" aria-label="Video library controls">
+        <label class="search-box">
+          <span aria-hidden="true">⌕</span>
+          <input id="video-search" type="search" placeholder="Search videos" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+        <div class="filter-group" role="group" aria-label="Filter by watched status">
+          <button class="filter-button selected" type="button" data-video-filter="all" aria-pressed="true">All</button>
+          <button class="filter-button" type="button" data-video-filter="unwatched" aria-pressed="false">Unwatched</button>
+          <button class="filter-button" type="button" data-video-filter="watched" aria-pressed="false">Watched</button>
+        </div>
+        <div class="filter-group" role="group" aria-label="Video view mode">
+          <button class="filter-button selected" type="button" data-video-mode="all" aria-pressed="true">All videos</button>
+          <button class="filter-button" type="button" data-video-mode="folders" aria-pressed="false">Folders</button>
+        </div>
+      </section>
+      <nav class="video-breadcrumb" id="video-breadcrumb" aria-label="Video folders" hidden></nav>
+      <p class="result-note" id="videos-result-note" aria-live="polite"></p>
+      <div class="program-grid" id="video-grid" aria-live="polite" aria-busy="true"></div>
+      <div class="empty-state" id="videos-empty-state" hidden>
+        <span class="empty-mark" aria-hidden="true">—</span>
+        <h2 id="videos-empty-title">No videos found</h2>
+        <p id="videos-empty-description">Try another search or change the watched filter.</p>
       </div>
     </main>
 
@@ -243,6 +279,12 @@
                 <option value="1.9">1.9×</option>
                 <option value="2.0">2.0×</option>
               </select>
+              <div class="player-volume-control">
+                <button class="player-button player-icon-button" id="player-mute" type="button" aria-label="Mute" title="Mute">
+                  <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" /><path d="M15.5 8.5a5 5 0 0 1 0 7m3-10a9 9 0 0 1 0 13" /></svg>
+                </button>
+                <input id="player-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+              </div>
               <label class="player-select-label" for="subtitle-track">Subtitles</label>
               <select class="player-select" id="subtitle-track" aria-label="Subtitle track">
                 <option value="">Off</option>
