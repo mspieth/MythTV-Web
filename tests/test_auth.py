@@ -233,6 +233,22 @@ def test_login_round_trip_keeps_forwarded_prefix(tmp_path):
     assert response.location.startswith("/mythtv-web/")
 
 
+def test_authenticated_browser_back_from_library_skips_login_form(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
+        connection.execute("UPDATE users SET must_change_password = 0")
+
+    response = login(client, "admin", INITIAL_PASSWORD)
+    assert response.status_code == 302
+
+    back_response = client.get("/login")
+
+    assert back_response.status_code == 302
+    assert back_response.location == "/"
+    assert client.get(back_response.location).status_code == 200
+
+
 def test_admin_manages_accounts_and_regular_users_cannot_manage_users(tmp_path):
     app = make_app(tmp_path)
     admin = app.test_client()

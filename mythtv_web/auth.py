@@ -250,6 +250,16 @@ def deletion_allowed(view):
 def login():
     next_url = request.values.get("next")
     if request.method == "GET":
+        if g.current_user is not None:
+            if g.current_user["must_change_password"]:
+                return redirect(url_for("auth.change_password"))
+            destination = _safe_next_url(next_url)
+            if destination is None or urlsplit(destination).path in {
+                url_for("index"),
+                url_for("auth.login"),
+            }:
+                destination = url_for("index")
+            return redirect(destination)
         return render_template("login.html", next_url=next_url, error=None)
 
     username = request.form.get("username", "").strip()
