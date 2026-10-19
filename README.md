@@ -10,7 +10,21 @@ This started out as a fun project to play with AI and is not meant to replace th
 
 ## Quick start
 
-Install [uv using its official installation guide](https://docs.astral.sh/uv/getting-started/installation/) and Node.js 20 or newer, then run these commands from the project directory:
+On Linux, install uv with its official installer and verify it is available on your `PATH`:
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
+```
+
+To install uv system-wide in `/usr/local/bin` instead (requires `sudo`):
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+/usr/local/bin/uv --version
+```
+
+Open a new terminal if `uv` is not found immediately after installation. For other platforms, see the [official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/). Install Node.js 20 or newer, then run these commands from the project directory:
 
 ```sh
 npm ci
