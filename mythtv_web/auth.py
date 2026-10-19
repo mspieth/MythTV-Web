@@ -225,10 +225,13 @@ def _valid_password(password: str) -> bool:
     return MIN_PASSWORD_LENGTH <= len(password) <= 1024
 
 
-def _safe_next_url(target: str | None) -> str | None:
+def _safe_next_endpoint(target: str | None) -> str | None:
     if not target:
         return None
-    parsed = urlsplit(target)
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return None
     if (
         parsed.scheme
         or parsed.netloc
@@ -237,7 +240,24 @@ def _safe_next_url(target: str | None) -> str | None:
         or "\\" in target
     ):
         return None
-    return target
+    path = parsed.path
+    prefix = request.script_root.rstrip("/")
+    if prefix and (path == prefix or path.startswith(f"{prefix}/")):
+        path = path[len(prefix) :] or "/"
+    return {
+        "/": "index",
+        "/admin/users": "auth.users",
+        "/change-password": "auth.change_password",
+    }.get(path)
+
+
+def _redirect_after_login(target: str | None):
+    endpoint = _safe_next_endpoint(target)
+    if endpoint == "auth.users":
+        return redirect(url_for("auth.users"))
+    if endpoint == "auth.change_password":
+        return redirect(url_for("auth.change_password"))
+    return redirect(url_for("index"))
 
 
 def admin_required(view):
@@ -267,13 +287,7 @@ def login():
         if g.current_user is not None:
             if g.current_user["must_change_password"]:
                 return redirect(url_for("auth.change_password"))
-            destination = _safe_next_url(next_url)
-            if destination is None or urlsplit(destination).path in {
-                url_for("index"),
-                url_for("auth.login"),
-            }:
-                destination = url_for("index")
-            return redirect(destination)
+            return _redirect_after_login(next_url)
         error = (
             "Your sign-in form expired. Please enter your details again."
             if request.args.get("csrf") == "expired"
@@ -305,10 +319,7 @@ def login():
     session["csrf_token"] = secrets.token_urlsafe(32)
     if user["must_change_password"]:
         return redirect(url_for("auth.change_password"))
-    destination = _safe_next_url(next_url)
-    if destination is None or urlsplit(destination).path == "/":
-        destination = url_for("index")
-    return redirect(destination)
+    return _redirect_after_login(next_url)
 
 
 @auth.post("/logout")

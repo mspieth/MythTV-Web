@@ -305,6 +305,27 @@ def test_login_root_destination_stays_inside_forwarded_prefix(tmp_path):
     assert response.location == "/mythtv-web/"
 
 
+def test_login_ignores_external_next_url(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    with sqlite3.connect(app.config["AUTH_DATABASE_PATH"]) as connection:
+        connection.execute("UPDATE users SET must_change_password = 0")
+
+    login_page = client.get("/login?next=https%3A%2F%2Fattacker.example%2F")
+    response = client.post(
+        "/login",
+        data={
+            "csrf_token": csrf_token(login_page),
+            "username": "admin",
+            "password": INITIAL_PASSWORD,
+            "next": "https://attacker.example/",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.location == "/"
+
+
 def test_stale_login_csrf_refreshes_form_without_accepting_submission(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()

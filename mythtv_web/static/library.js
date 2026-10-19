@@ -839,8 +839,8 @@ function makeVideoCard(video, index) {
   actions.append(makeRecordingAction(
     video.Watched ? "Mark unwatched" : "Mark watched",
     video.Watched
-      ? '<path d="M4 12a8 8 0 1 0 2.34-5.66L4 8.5" /><path d="M4 4v4.5h4.5" />'
-      : '<path d="m5 12 4 4L19 6" />',
+      ? ["M4 12a8 8 0 1 0 2.34-5.66L4 8.5", "M4 4v4.5h4.5"]
+      : ["m5 12 4 4L19 6"],
     () => updateVideoWatched(video),
   ));
   card.append(playButton, actions);
@@ -1103,13 +1103,30 @@ function makePoster(sourceUrl, badgeText = "", fallbackUrl = "", artworkType = "
   return poster;
 }
 
-function makeRecordingAction(label, iconMarkup, handler) {
+function makeRecordingAction(label, iconParts, handler) {
   const button = document.createElement("button");
   button.className = "recording-action";
   button.type = "button";
   button.setAttribute("aria-label", label);
   button.title = label;
-  button.innerHTML = `<svg class="recording-action-icon" viewBox="0 0 24 24" aria-hidden="true">${iconMarkup}</svg>`;
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("class", "recording-action-icon");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("aria-hidden", "true");
+  for (const part of iconParts) {
+    if (typeof part === "string") {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", part);
+      icon.append(path);
+    } else {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", part.x);
+      text.setAttribute("y", part.y);
+      text.textContent = part.text;
+      icon.append(text);
+    }
+  }
+  button.append(icon);
   button.addEventListener("click", handler);
   return button;
 }
@@ -1241,19 +1258,23 @@ function makeProgramCard(program, index) {
   const recordingActions = [
     makeRecordingAction(
       "Play from beginning",
-      '<path d="M5 5v14l11-7zM19 7a8 8 0 1 1-2-2" /><path d="M19 3v4h-4" /><text x="11" y="16">0</text>',
+      [
+        "M5 5v14l11-7zM19 7a8 8 0 1 1-2-2",
+        "M19 3v4h-4",
+        { x: "11", y: "16", text: "0" },
+      ],
       () => openPlayer(program, "beginning"),
     ),
     makeRecordingAction(
       "Play from bookmark",
-      '<path d="M6 3h12v18l-6-4-6 4z" />',
+      ["M6 3h12v18l-6-4-6 4z"],
       () => openPlayer(program, "bookmark"),
     ),
   ];
   if (deleteDialog && CAN_DELETE) {
     recordingActions.push(makeRecordingAction(
       "Delete recording",
-      '<path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3" />',
+      ["M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3"],
       () => showDeleteDialog(program),
     ));
   }
