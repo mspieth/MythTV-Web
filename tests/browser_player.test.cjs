@@ -14,8 +14,9 @@ function deferred() {
 
 function harness() {
   class Element extends EventTarget {
-    constructor() {
+    constructor(tagName = "div") {
       super();
+      this.tagName = tagName;
       this.dataset = {};
       this.content = "";
       this.value = "";
@@ -25,6 +26,7 @@ function harness() {
       this.playCalls = 0;
       this.open = false;
       this.attributes = new Map();
+      this.children = [];
       const classes = new Set();
       this.classList = {
         add: (...names) => names.forEach((name) => classes.add(name)),
@@ -43,9 +45,9 @@ function harness() {
     setAttribute(name, value) { this.attributes.set(name, value); }
     getAttribute(name) { return this.attributes.get(name) ?? null; }
     removeAttribute(name) { delete this[name]; }
-    append() {}
+    append(...children) { this.children.push(...children); }
     contains(element) { return element === this; }
-    replaceChildren() {}
+    replaceChildren(...children) { this.children = children; }
     add() {}
     focus() {}
     showModal() { this.open = true; }
@@ -64,7 +66,8 @@ function harness() {
     body: new Element(),
     querySelector: element,
     querySelectorAll: () => [],
-    createElement: () => new Element(),
+    createElement: (tagName) => new Element(tagName),
+    createElementNS: (_namespace, tagName) => new Element(tagName),
     pictureInPictureEnabled: true,
     fullscreenElement: null,
   });
@@ -192,4 +195,14 @@ test("detach toggles Picture-in-Picture and exits theater mode", async () => {
   await settle();
   assert.equal(h.document.pictureInPictureElement, null);
   assert.equal(h.element("#player-detach").getAttribute("aria-pressed"), "false");
+});
+
+test("player icons use SVG DOM nodes instead of HTML parsing", () => {
+  const h = harness();
+  h.video.dispatchEvent(new Event("play"));
+  const icon = h.element("#player-toggle").children[0];
+  assert.equal(icon.tagName, "svg");
+  assert.equal(icon.children[0].tagName, "path");
+  assert.equal(icon.getAttribute("aria-hidden"), "true");
+  assert.doesNotMatch(source, /\.innerHTML\b/);
 });

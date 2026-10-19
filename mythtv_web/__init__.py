@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -169,6 +170,19 @@ def _subtitle_start_time():
     return start if math.isfinite(start) and start >= 0 else None
 
 
+def _transcode_start_argument() -> str | None:
+    raw_start = request.args.get("start", "0")
+    if len(raw_start) > 32 or re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw_start) is None:
+        return None
+    try:
+        start = Decimal(raw_start)
+    except InvalidOperation:
+        return None
+    if not start.is_finite() or start > Decimal(7 * 24 * 60 * 60):
+        return None
+    return format(start.normalize(), "f")
+
+
 @lru_cache(maxsize=128)
 def _probe_video(app: Flask, video_id: int) -> dict:
     ffprobe = shutil.which("ffprobe")
@@ -227,7 +241,7 @@ def _probe_video(app: Flask, video_id: int) -> dict:
 
 
 def _start_transcode(
-    app: Flask, ffmpeg: str, source_url: str, start: float, token: str, resource_id: int
+    app: Flask, ffmpeg: str, source_url: str, start: str, token: str, resource_id: int
 ):
     threads = str(app.config["MYTHTV_FFMPEG_THREADS"])
     command = [
@@ -240,7 +254,7 @@ def _start_transcode(
         "-filter_threads",
         threads,
         "-ss",
-        str(start),
+        start,
         "-readrate",
         str(TRANSCODE_READ_RATE),
         "-readrate_initial_burst",
@@ -1708,14 +1722,9 @@ def create_app(config: dict | None = None) -> Flask:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return jsonify(error="FFmpeg is required to transcode this recording"), 501
-        start = request.args.get("start", default=0.0, type=float)
+        start = _transcode_start_argument()
         token = request.args.get("token", "")
-        if (
-            start is None
-            or not math.isfinite(start)
-            or start < 0
-            or start > 7 * 24 * 60 * 60
-        ):
+        if start is None:
             return jsonify(error="Invalid playback start position"), 400
         if not re.fullmatch(r"[a-f0-9]{32}", token):
             return jsonify(error="A valid transcode token is required"), 400
@@ -1746,14 +1755,9 @@ def create_app(config: dict | None = None) -> Flask:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return jsonify(error="FFmpeg is required to transcode this video"), 501
-        start = request.args.get("start", default=0.0, type=float)
+        start = _transcode_start_argument()
         token = request.args.get("token", "")
-        if (
-            start is None
-            or not math.isfinite(start)
-            or start < 0
-            or start > 7 * 24 * 60 * 60
-        ):
+        if start is None:
             return jsonify(error="Invalid playback start position"), 400
         if not re.fullmatch(r"[a-f0-9]{32}", token):
             return jsonify(error="A valid transcode token is required"), 400

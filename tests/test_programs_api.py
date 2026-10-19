@@ -1663,6 +1663,27 @@ def test_video_transcode_streams_mythtv_video_as_mp4(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
+    "endpoint", ["/api/playback/42/transcode", "/api/videos/17/transcode"]
+)
+@pytest.mark.parametrize("start", ["--help", "-1", "1e3", "604800.1"])
+def test_transcodes_reject_invalid_start_before_spawning(monkeypatch, endpoint, start):
+    monkeypatch.setattr("mythtv_web._active_recording", lambda *_: {"Recording": {}})
+    monkeypatch.setattr("mythtv_web.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        "mythtv_web.transcodes.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("invalid start reached FFmpeg"),
+    )
+
+    response = (
+        create_app()
+        .test_client()
+        .get(f"{endpoint}?start={start}&token={'d' * 32}", buffered=False)
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
     ("codec", "start", "expected_decoder_options"),
     [
         ("subrip", 0, []),

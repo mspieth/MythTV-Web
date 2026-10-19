@@ -98,6 +98,19 @@ function appLocalPath(path) {
     : appPath(path);
 }
 
+function setSvgIcon(target, className, viewBox, pathData) {
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  if (className) icon.setAttribute("class", className);
+  icon.setAttribute("viewBox", viewBox);
+  icon.setAttribute("aria-hidden", "true");
+  for (const definition of pathData) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", definition);
+    icon.append(path);
+  }
+  target.replaceChildren(icon);
+}
+
 function formatDate(value) {
   if (!value) return "Date unknown";
   const date = new Date(value);
@@ -809,7 +822,7 @@ function makeVideoCard(video, index) {
   const playIcon = document.createElement("span");
   playIcon.className = "poster-play-mark";
   playIcon.setAttribute("aria-hidden", "true");
-  playIcon.innerHTML = '<svg viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z" /></svg>';
+  setSvgIcon(playIcon, "", "0 0 24 24", ["m8 5 12 7-12 7z"]);
   playButton.append(playIcon);
   playButton.addEventListener("click", () => openVideoPlayer(video));
 
@@ -925,7 +938,9 @@ function makeVideoFolderCard(directory, index) {
   button.className = "video-folder-button";
   button.type = "button";
   button.setAttribute("aria-label", `Open folder ${directory.name}, ${directory.matchingVideos} videos`);
-  button.innerHTML = '<svg class="video-folder-icon" viewBox="0 0 32 26" aria-hidden="true"><path d="M2 5.5A2.5 2.5 0 0 1 4.5 3h7l3 3h13A2.5 2.5 0 0 1 30 8.5v13a2.5 2.5 0 0 1-2.5 2.5h-21A4.5 4.5 0 0 1 2 19.5z" /></svg>';
+  setSvgIcon(button, "video-folder-icon", "0 0 32 26", [
+    "M2 5.5A2.5 2.5 0 0 1 4.5 3h7l3 3h13A2.5 2.5 0 0 1 30 8.5v13a2.5 2.5 0 0 1-2.5 2.5h-21A4.5 4.5 0 0 1 2 19.5z",
+  ]);
   const name = document.createElement("h2");
   name.className = "video-folder-name";
   name.textContent = directory.name;
@@ -1231,7 +1246,7 @@ function makeProgramCard(program, index) {
   const posterPlayIcon = document.createElement("span");
   posterPlayIcon.className = "poster-play-mark";
   posterPlayIcon.setAttribute("aria-hidden", "true");
-  posterPlayIcon.innerHTML = '<svg viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z" /></svg>';
+  setSvgIcon(posterPlayIcon, "", "0 0 24 24", ["m8 5 12 7-12 7z"]);
   posterButton.append(posterPlayIcon);
   posterButton.addEventListener("click", () => openPlayer(program, "resume"));
 
@@ -1549,13 +1564,13 @@ playerVideo.addEventListener("play", () => {
   const button = document.querySelector("#player-toggle");
   button.setAttribute("aria-label", "Pause");
   button.title = "Pause";
-  button.innerHTML = '<svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14" /></svg>';
+  setSvgIcon(button, "player-icon", "0 0 24 24", ["M8 5v14M16 5v14"]);
 });
 playerVideo.addEventListener("pause", () => {
   const button = document.querySelector("#player-toggle");
   button.setAttribute("aria-label", "Play");
   button.title = "Play";
-  button.innerHTML = '<svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7z" /></svg>';
+  setSvgIcon(button, "player-icon", "0 0 24 24", ["m8 5 12 7-12 7z"]);
 });
 playerVideo.addEventListener("playing", () => {
   playerStatus.textContent = usingWasm
@@ -1623,9 +1638,14 @@ function updatePlayerVolumeControls() {
   const muted = playerVideo.muted || playerVideo.volume === 0;
   playerMute.setAttribute("aria-label", muted ? "Unmute" : "Mute");
   playerMute.title = muted ? "Unmute" : "Mute";
-  playerMute.innerHTML = muted
-    ? '<svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" /><path d="m16 9 5 6m0-6-5 6" /></svg>'
-    : '<svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" /><path d="M15.5 8.5a5 5 0 0 1 0 7m3-10a9 9 0 0 1 0 13" /></svg>';
+  setSvgIcon(
+    playerMute,
+    "player-icon",
+    "0 0 24 24",
+    muted
+      ? ["M11 5 6 9H3v6h3l5 4V5Z", "m16 9 5 6m0-6-5 6"]
+      : ["M11 5 6 9H3v6h3l5 4V5Z", "M15.5 8.5a5 5 0 0 1 0 7m3-10a9 9 0 0 1 0 13"],
+  );
 }
 playerVolume.addEventListener("input", (event) => {
   playerVideo.volume = Number(event.currentTarget.value);
