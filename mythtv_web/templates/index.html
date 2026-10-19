@@ -290,11 +290,20 @@
                 <option value="">Off</option>
               </select>
               <label class="smart-skip-control"><input id="smart-skip" type="checkbox" checked> Auto-skip commercials</label>
+              <button class="player-button player-icon-button" id="player-theater" type="button" aria-label="Enter theater mode" title="Enter theater mode">
+                <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v12H3z" /><path d="M8 10h8M8 14h8" /></svg>
+              </button>
+              <button class="player-button player-icon-button" id="player-exit-theater" type="button" aria-label="Exit theater mode" title="Exit theater mode" hidden>
+                <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v12H3z" /><path d="m8 10-3 2 3 2m8-4 3 2-3 2" /></svg>
+              </button>
               <button class="player-button player-icon-button" id="player-fullscreen" type="button" aria-label="Enter fullscreen" title="Enter fullscreen">
                 <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg>
               </button>
               <button class="player-button player-icon-button" id="player-exit-fullscreen" type="button" aria-label="Exit fullscreen" title="Exit fullscreen" hidden>
                 <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg>
+              </button>
+              <button class="player-button player-icon-button" id="player-detach" type="button" aria-label="Detach player with Picture-in-Picture" title="Detach player with Picture-in-Picture">
+                <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z" /><path d="M13 12h6v5h-6z" /></svg>
               </button>
             </div>
             <details class="player-details" id="player-details">

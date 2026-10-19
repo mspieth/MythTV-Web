@@ -24,13 +24,27 @@ function harness() {
       this.duration = 1000;
       this.playCalls = 0;
       this.open = false;
-      this.classList = { add() {}, remove() {}, toggle() {} };
+      this.attributes = new Map();
+      const classes = new Set();
+      this.classList = {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        contains: (name) => classes.has(name),
+        toggle: (name, force) => {
+          const enabled = force ?? !classes.has(name);
+          if (enabled) classes.add(name);
+          else classes.delete(name);
+          return enabled;
+        },
+      };
     }
     querySelector() { return new Element(); }
     querySelectorAll() { return []; }
-    setAttribute() {}
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
     removeAttribute(name) { delete this[name]; }
     append() {}
+    contains(element) { return element === this; }
     replaceChildren() {}
     add() {}
     focus() {}
@@ -51,8 +65,18 @@ function harness() {
     querySelector: element,
     querySelectorAll: () => [],
     createElement: () => new Element(),
+    pictureInPictureEnabled: true,
     fullscreenElement: null,
   });
+  const video = element("#recording-video");
+  video.requestPictureInPicture = async () => {
+    document.pictureInPictureElement = video;
+    video.dispatchEvent(new Event("enterpictureinpicture"));
+  };
+  document.exitPictureInPicture = async () => {
+    document.pictureInPictureElement = null;
+    video.dispatchEvent(new Event("leavepictureinpicture"));
+  };
   const window = Object.assign(new EventTarget(), {
     setTimeout: (fn, delay) => { const timer = setTimeout(fn, delay); timer.unref(); return timer; },
     clearTimeout,
@@ -69,7 +93,7 @@ function harness() {
     },
   });
   vm.runInContext(source, context);
-  return { context, requests, element, video: element("#recording-video"), dialog: element("#player-dialog") };
+  return { context, requests, element, document, video, dialog: element("#player-dialog") };
 }
 
 function program(id) {
@@ -143,4 +167,29 @@ test("closing cancels media event waits and delayed saves cannot close a new pla
   h.context.closePlayer();
   respond(h.requests.find((r) => r.url === "/api/playback/44"), info(44));
   await third;
+});
+
+test("theater mode expands the shared player and can be exited", () => {
+  const h = harness();
+  h.element("#player-theater").dispatchEvent(new Event("click"));
+  assert.equal(h.dialog.classList.contains("theater-mode"), true);
+  assert.equal(h.element(".player-shell").classList.contains("theater-mode"), true);
+  assert.equal(h.element("#player-exit-theater").hidden, false);
+  h.element("#player-exit-theater").dispatchEvent(new Event("click"));
+  assert.equal(h.dialog.classList.contains("theater-mode"), false);
+  assert.equal(h.element("#player-exit-theater").hidden, true);
+});
+
+test("detach toggles Picture-in-Picture and exits theater mode", async () => {
+  const h = harness();
+  h.element("#player-theater").dispatchEvent(new Event("click"));
+  h.element("#player-detach").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(h.document.pictureInPictureElement, h.video);
+  assert.equal(h.dialog.classList.contains("theater-mode"), false);
+  assert.equal(h.element("#player-detach").getAttribute("aria-pressed"), "true");
+  h.element("#player-detach").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(h.document.pictureInPictureElement, null);
+  assert.equal(h.element("#player-detach").getAttribute("aria-pressed"), "false");
 });

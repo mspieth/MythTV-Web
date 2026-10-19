@@ -26,6 +26,9 @@ const playerDialog = document.querySelector("#player-dialog");
 const playerVideo = document.querySelector("#recording-video");
 const playerShell = document.querySelector(".player-shell");
 const playerOverlay = document.querySelector("#player-overlay");
+const playerTheaterButton = document.querySelector("#player-theater");
+const playerExitTheaterButton = document.querySelector("#player-exit-theater");
+const playerDetachButton = document.querySelector("#player-detach");
 const playerVolume = document.querySelector("#player-volume");
 const playerMute = document.querySelector("#player-mute");
 let lastNonzeroVolume = 1;
@@ -707,6 +710,12 @@ function closePlayer() {
     });
   }
   if (!activeRecording && !activeVideo) return;
+  setTheaterMode(false);
+  if (document.pictureInPictureElement === playerVideo && document.exitPictureInPicture) {
+    document.exitPictureInPicture().catch((error) => {
+      playerStatus.textContent = `Could not reattach player: ${error.message}`;
+    });
+  }
   savePlaybackPosition();
   playerController?.abort();
   playerController = null;
@@ -1667,32 +1676,106 @@ setBookmarkButton.addEventListener("click", async () => {
 document.querySelector("#subtitle-track").addEventListener("change", (event) => {
   selectSubtitle(event.currentTarget.value);
 });
-function updateFullscreenControls() {
-  const fullscreen = document.fullscreenElement === playerShell;
-  document.querySelector("#player-fullscreen").hidden = fullscreen;
-  document.querySelector("#player-exit-fullscreen").hidden = !fullscreen;
-  playerShell.classList.toggle("controls-visible", fullscreen);
-  window.clearTimeout(controlsHideTimer);
-  if (fullscreen) {
-    revealFullscreenControls();
-  }
+function isExpandedPlayer() {
+  return (
+    document.fullscreenElement === playerShell
+    || playerShell.classList.contains("theater-mode")
+  );
 }
 
-function revealFullscreenControls() {
-  if (document.fullscreenElement !== playerShell) return;
+function updatePictureInPictureButton() {
+  const supported = (
+    document.pictureInPictureEnabled
+    && typeof playerVideo.requestPictureInPicture === "function"
+    && typeof document.exitPictureInPicture === "function"
+  );
+  const active = document.pictureInPictureElement === playerVideo;
+  const fullscreen = document.fullscreenElement === playerShell;
+  const label = !supported
+    ? "Picture-in-Picture is not supported"
+    : fullscreen
+      ? "Exit fullscreen to detach player"
+      : active
+        ? "Return player from Picture-in-Picture"
+        : "Detach player with Picture-in-Picture";
+  playerDetachButton.disabled = !supported || fullscreen;
+  playerDetachButton.setAttribute("aria-label", label);
+  playerDetachButton.setAttribute("aria-pressed", String(active));
+  playerDetachButton.title = label;
+}
+
+function updateFullscreenControls() {
+  const fullscreen = document.fullscreenElement === playerShell;
+  if (fullscreen) {
+    playerShell.classList.remove("theater-mode");
+    playerDialog.classList.remove("theater-mode");
+  }
+  const theater = playerShell.classList.contains("theater-mode");
+  document.querySelector("#player-fullscreen").hidden = fullscreen;
+  document.querySelector("#player-exit-fullscreen").hidden = !fullscreen;
+  playerTheaterButton.hidden = fullscreen || theater;
+  playerExitTheaterButton.hidden = !theater || fullscreen;
+  playerShell.classList.toggle("controls-visible", fullscreen || theater);
+  window.clearTimeout(controlsHideTimer);
+  updatePictureInPictureButton();
+  if (fullscreen || theater) revealExpandedPlayerControls();
+}
+
+function setTheaterMode(enabled) {
+  const theater = Boolean(enabled && document.fullscreenElement !== playerShell);
+  playerShell.classList.toggle("theater-mode", theater);
+  playerDialog.classList.toggle("theater-mode", theater);
+  updateFullscreenControls();
+}
+
+function revealExpandedPlayerControls() {
+  if (!isExpandedPlayer()) return;
   playerShell.classList.add("controls-visible");
   window.clearTimeout(controlsHideTimer);
   controlsHideTimer = window.setTimeout(() => {
     if (playerOverlay.contains(document.activeElement)) return;
-    playerShell.classList.remove("controls-visible");
+    if (isExpandedPlayer()) playerShell.classList.remove("controls-visible");
   }, 2500);
 }
+
+async function togglePictureInPicture() {
+  if (
+    !document.pictureInPictureEnabled
+    || typeof playerVideo.requestPictureInPicture !== "function"
+    || typeof document.exitPictureInPicture !== "function"
+  ) {
+    playerStatus.textContent = "Picture-in-Picture is not supported by this browser.";
+    return;
+  }
+  if (document.fullscreenElement === playerShell) {
+    playerStatus.textContent = "Exit fullscreen before detaching the player.";
+    return;
+  }
+  try {
+    if (document.pictureInPictureElement === playerVideo) {
+      await document.exitPictureInPicture();
+    } else {
+      setTheaterMode(false);
+      await playerVideo.requestPictureInPicture();
+    }
+  } catch (error) {
+    playerStatus.textContent = `Could not detach player: ${error.message}`;
+  }
+  updatePictureInPictureButton();
+}
+
+playerTheaterButton.addEventListener("click", () => setTheaterMode(true));
+playerExitTheaterButton.addEventListener("click", () => setTheaterMode(false));
+playerDetachButton.addEventListener("click", togglePictureInPicture);
+playerVideo.addEventListener("enterpictureinpicture", updatePictureInPictureButton);
+playerVideo.addEventListener("leavepictureinpicture", updatePictureInPictureButton);
 
 document.querySelector("#player-fullscreen").addEventListener("click", () => {
   if (!playerShell.requestFullscreen) {
     playerStatus.textContent = "Fullscreen is not supported by this browser.";
     return;
   }
+  setTheaterMode(false);
   playerShell.requestFullscreen()
     .then(updateFullscreenControls)
     .catch((error) => { playerStatus.textContent = `Could not enter fullscreen: ${error.message}`; });
@@ -1703,14 +1786,15 @@ document.querySelector("#player-exit-fullscreen").addEventListener("click", () =
   }
 });
 document.addEventListener("fullscreenchange", updateFullscreenControls);
-playerShell.addEventListener("pointermove", revealFullscreenControls);
-playerShell.addEventListener("pointerdown", revealFullscreenControls);
-playerShell.addEventListener("touchstart", revealFullscreenControls, { passive: true });
-playerShell.addEventListener("keydown", revealFullscreenControls);
-playerShell.addEventListener("focusin", revealFullscreenControls);
+playerShell.addEventListener("pointermove", revealExpandedPlayerControls);
+playerShell.addEventListener("pointerdown", revealExpandedPlayerControls);
+playerShell.addEventListener("touchstart", revealExpandedPlayerControls, { passive: true });
+playerShell.addEventListener("keydown", revealExpandedPlayerControls);
+playerShell.addEventListener("focusin", revealExpandedPlayerControls);
 playerOverlay.addEventListener("focusout", (event) => {
-  if (!playerOverlay.contains(event.relatedTarget)) revealFullscreenControls();
+  if (!playerOverlay.contains(event.relatedTarget)) revealExpandedPlayerControls();
 });
+updateFullscreenControls();
 
 function focusPlayerControlInDirection(current, direction) {
   const selector = "button:not(:disabled):not([hidden]), input:not(:disabled), select:not(:disabled), summary, video[tabindex]";
