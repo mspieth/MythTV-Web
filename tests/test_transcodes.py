@@ -83,3 +83,35 @@ def test_crashed_job_registration_does_not_consume_capacity(tmp_path):
     finally:
         crashed.close()
         replacement.close()
+
+
+def test_registry_rejects_path_traversal_tokens_before_filesystem_access(
+    monkeypatch, tmp_path
+):
+    registry = TranscodeRegistry(str(tmp_path), 1)
+    monkeypatch.setattr(
+        "mythtv_web.transcodes.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("invalid token reached process launch"),
+    )
+
+    with pytest.raises(ValueError, match="Invalid transcode token"):
+        registry.start(COMMAND, "../outside", 42, USER)
+
+    assert not registry.cancel("../outside", 42, USER)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_registry_does_not_use_token_as_registration_path(tmp_path):
+    registry = TranscodeRegistry(str(tmp_path), 1)
+    token = "e" * 32
+    outside_path = tmp_path.parent / "outside-transcode.json"
+    outside_path.write_text("unchanged")
+    (tmp_path / f"{token}.json").symlink_to(outside_path)
+
+    job = registry.start(COMMAND, token, 42, USER)
+    try:
+        assert job.path.parent == tmp_path
+        assert job.path.name != f"{token}.json"
+        assert outside_path.read_text() == "unchanged"
+    finally:
+        job.close()

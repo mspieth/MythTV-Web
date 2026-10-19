@@ -1593,9 +1593,10 @@ def test_transcode_stream_removes_process_registration_after_completion(
     response = app.test_client().get(
         f"/api/playback/42/transcode?start=123.5&token={token}", buffered=False
     )
-    process_path = tmp_path / "transcodes" / f"{token}.json"
+    process_path = next((tmp_path / "transcodes").glob("*.json"))
 
     assert response.status_code == 200
+    assert process_path.name != f"{token}.json"
     assert commands[0][commands[0].index("-ss") + 1] == "123.5"
     assert commands[0][commands[0].index("-readrate") + 1] == "2"
     assert commands[0][commands[0].index("-readrate_initial_burst") + 1] == "2"
@@ -1646,9 +1647,10 @@ def test_video_transcode_streams_mythtv_video_as_mp4(monkeypatch, tmp_path):
     response = app.test_client().get(
         f"/api/videos/16509/transcode?start=12.5&token={token}", buffered=False
     )
-    process_path = tmp_path / "transcodes" / f"{token}.json"
+    process_path = next((tmp_path / "transcodes").glob("*.json"))
 
     assert response.status_code == 200
+    assert process_path.name != f"{token}.json"
     assert response.content_type == "video/mp4"
     assert commands[0][commands[0].index("-ss") + 1] == "12.5"
     assert commands[0][commands[0].index("-readrate") + 1] == "2"

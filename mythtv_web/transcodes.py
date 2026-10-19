@@ -1,8 +1,10 @@
 """Shared FFmpeg job registration and safe cancellation on Linux."""
 
 import fcntl
+import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -76,6 +78,12 @@ class TranscodeRegistry:
         self.directory = Path(directory)
         self.limit = limit
 
+    @staticmethod
+    def _token_hash(token: str) -> str | None:
+        if not isinstance(token, str) or re.fullmatch(r"[a-f0-9]{32}", token) is None:
+            return None
+        return hashlib.sha256(token.encode("ascii")).hexdigest()
+
     @contextmanager
     def locked(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -86,6 +94,8 @@ class TranscodeRegistry:
     @staticmethod
     def read(path: Path) -> dict | None:
         try:
+            if path.is_symlink():
+                return None
             result = json.loads(path.read_text())
             if isinstance(result, dict) and type(result.get("pid")) is int:
                 return result
@@ -96,7 +106,9 @@ class TranscodeRegistry:
     def start(
         self, command: list[str], token: str, recorded_id: int, user: dict
     ) -> Job:
-        path = self.directory / f"{token}.json"
+        token_hash = self._token_hash(token)
+        if token_hash is None:
+            raise ValueError("Invalid transcode token")
         with self.locked():
             active = 0
             for registered in self.directory.glob("*.json"):
@@ -104,12 +116,20 @@ class TranscodeRegistry:
                 identity = _process_identity(metadata["pid"]) if metadata else None
                 if identity and identity == metadata.get("identity"):
                     active += 1
-                    if registered == path:
+                    if (
+                        metadata.get("token_hash") == token_hash
+                        or registered.stem == token
+                    ):
                         raise TokenActiveError
                 else:
                     registered.unlink(missing_ok=True)
             if active >= self.limit:
                 raise CapacityError
+            job_id = secrets.token_hex(16)
+            path = self.directory / f"{job_id}.json"
+            while path.exists():
+                job_id = secrets.token_hex(16)
+                path = self.directory / f"{job_id}.json"
             process = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
@@ -118,7 +138,8 @@ class TranscodeRegistry:
                 if identity is None:
                     raise OSError("Cannot identify the FFmpeg process")
                 metadata = {
-                    "job_id": secrets.token_hex(16),
+                    "job_id": job_id,
+                    "token_hash": token_hash,
                     "pid": process.pid,
                     "identity": identity,
                     "recorded_id": recorded_id,
@@ -135,9 +156,21 @@ class TranscodeRegistry:
                 raise
 
     def cancel(self, token: str, recorded_id: int, user: dict) -> bool:
-        path = self.directory / f"{token}.json"
+        token_hash = self._token_hash(token)
+        if token_hash is None:
+            return False
         with self.locked():
-            metadata = self.read(path)
+            path = None
+            metadata = None
+            for registered in self.directory.glob("*.json"):
+                candidate = self.read(registered)
+                if candidate and (
+                    candidate.get("token_hash") == token_hash
+                    or registered.stem == token
+                ):
+                    path = registered
+                    metadata = candidate
+                    break
             if not metadata or (
                 metadata.get("recorded_id") != recorded_id
                 or metadata.get("user_id") != user["id"]
