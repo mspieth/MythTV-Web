@@ -23,6 +23,7 @@ function harness() {
       this.textContent = "";
       this.currentTime = 0;
       this.duration = 1000;
+      this.track = { mode: "disabled" };
       this.playCalls = 0;
       this.open = false;
       this.attributes = new Map();
@@ -45,6 +46,7 @@ function harness() {
     setAttribute(name, value) { this.attributes.set(name, value); }
     getAttribute(name) { return this.attributes.get(name) ?? null; }
     removeAttribute(name) { delete this[name]; }
+    remove() { this.removed = true; }
     append(...children) { this.children.push(...children); }
     contains(element) { return element === this; }
     replaceChildren(...children) { this.children = children; }
@@ -205,4 +207,19 @@ test("player icons use SVG DOM nodes instead of HTML parsing", () => {
   assert.equal(icon.children[0].tagName, "path");
   assert.equal(icon.getAttribute("aria-hidden"), "true");
   assert.doesNotMatch(source, /\.innerHTML\b/);
+});
+
+test("subtitle URLs use the matched numeric track metadata", async () => {
+  const h = harness();
+  vm.runInContext(
+    'activeVideo = { Id: 17 }; videoPlaybackInfo = { subtitles: [{ index: 2, language: "en", title: "English" }] };',
+    h.context,
+  );
+
+  await h.context.selectSubtitle("2");
+
+  assert.equal(
+    h.video.children[0].src,
+    "/api/videos/17/subtitles/2?start=0",
+  );
 });

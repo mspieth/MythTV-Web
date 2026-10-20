@@ -407,9 +407,14 @@ async function selectSubtitle(streamIndex) {
     ? videoPlaybackInfo?.subtitles || []
     : playbackInfo?.media.subtitles || [];
   const trackInfo = tracks.find(
-    (track) => String(track.index) === streamIndex,
+    (track) => Number.isSafeInteger(track.index) && String(track.index) === streamIndex,
   );
   if (!trackInfo) return;
+  const resourceId = activeVideo
+    ? activeVideo.Id
+    : activeRecording.Recording.RecordedId;
+  if (!Number.isSafeInteger(resourceId) || resourceId <= 0) return;
+  const safeStreamIndex = trackInfo.index;
   const track = document.createElement("track");
   const generation = playerGeneration;
   track.kind = "subtitles";
@@ -420,8 +425,8 @@ async function selectSubtitle(streamIndex) {
   );
   track.srclang = /^[a-z]{2,3}$/i.test(trackInfo.language) ? trackInfo.language : "und";
   const subtitlePath = activeVideo
-    ? `/api/videos/${activeVideo.Id}/subtitles/${streamIndex}`
-    : `/api/playback/${activeRecording.Recording.RecordedId}/subtitles/${streamIndex}`;
+    ? `/api/videos/${resourceId}/subtitles/${safeStreamIndex}`
+    : `/api/playback/${resourceId}/subtitles/${safeStreamIndex}`;
   const subtitleStart = usingTranscode || usingWasm ? transcodeBase : 0;
   track.src = appPath(`${subtitlePath}?start=${encodeURIComponent(subtitleStart)}`);
   track.addEventListener("load", () => {
