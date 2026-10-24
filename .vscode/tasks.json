@@ -1,0 +1,25 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "uv: sync dependencies",
+            "type": "process",
+            "command": "uv",
+            "args": ["sync", "--dev"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "uv: run app",
+            "type": "process",
+            "command": "uv",
+            "args": ["run", "mythtv-web"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

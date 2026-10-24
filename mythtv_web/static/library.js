@@ -3,8 +3,15 @@ let currentPrograms = [];
 let selectedGroupTitle = null;
 let selectedGroupArtwork = null;
 let selectedGroupArtworkType = null;
+let recordingGroupsScrollY = 0;
 let totalRecordings = 0;
 let activeFilter = "all";
+let videos = [];
+let activeVideoFilter = "all";
+let activeVideoMode = "all";
+let videoDirectoryPath = [];
+const videoDirectoryScrollPositions = new Map();
+let activeVideo = null;
 let loading = false;
 
 const grid = document.querySelector("#program-grid");
@@ -19,6 +26,12 @@ const playerDialog = document.querySelector("#player-dialog");
 const playerVideo = document.querySelector("#recording-video");
 const playerShell = document.querySelector(".player-shell");
 const playerOverlay = document.querySelector("#player-overlay");
+const playerTheaterButton = document.querySelector("#player-theater");
+const playerExitTheaterButton = document.querySelector("#player-exit-theater");
+const playerDetachButton = document.querySelector("#player-detach");
+const playerVolume = document.querySelector("#player-volume");
+const playerMute = document.querySelector("#player-mute");
+let lastNonzeroVolume = 1;
 const deleteDialog = document.querySelector("#delete-dialog");
 const deleteCheckbox = document.querySelector("#delete-confirm-check");
 const deleteButton = document.querySelector("#delete-confirm-button");
@@ -31,6 +44,7 @@ const skipAdButton = document.querySelector("#skip-ad");
 const jumpForwardButton = document.querySelector("#jump-forward");
 const setBookmarkButton = document.querySelector("#set-bookmark");
 let activeRecording = null;
+let videoPlaybackInfo = null;
 let playbackInfo = null;
 let playerReturnFocus = null;
 let pendingDelete = null;
@@ -50,10 +64,52 @@ let controlsHideTimer = null;
 let forwardSkipTimer = null;
 let forwardSkipMode = false;
 let liveRecordingTimer = null;
+let playerController = null;
+let playerGeneration = 0;
+let playbackReady = false;
 const BROWSER_CONVERSION_ENABLED = false;
+
+function waitForPlayerEvent(eventName, signal, timeout = 30_000) {
+  return new Promise((resolve) => {
+    let timer;
+    const finish = (ready) => {
+      window.clearTimeout(timer);
+      playerVideo.removeEventListener(eventName, onReady);
+      playerVideo.removeEventListener("error", onError);
+      signal.removeEventListener("abort", onError);
+      resolve(ready);
+    };
+    const onReady = () => finish(true);
+    const onError = () => finish(false);
+    if (signal.aborted) return finish(false);
+    playerVideo.addEventListener(eventName, onReady, { once: true });
+    playerVideo.addEventListener("error", onError, { once: true });
+    signal.addEventListener("abort", onError, { once: true });
+    timer = window.setTimeout(onError, timeout);
+  });
+}
 
 function appPath(path) {
   return `${appRoot}${path}`;
+}
+
+function appLocalPath(path) {
+  return appRoot && (path === appRoot || path.startsWith(`${appRoot}/`))
+    ? path
+    : appPath(path);
+}
+
+function setSvgIcon(target, className, viewBox, pathData) {
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  if (className) icon.setAttribute("class", className);
+  icon.setAttribute("viewBox", viewBox);
+  icon.setAttribute("aria-hidden", "true");
+  for (const definition of pathData) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", definition);
+    icon.append(path);
+  }
+  target.replaceChildren(icon);
 }
 
 function formatDate(value) {
@@ -101,6 +157,16 @@ function playbackDuration(program) {
     : 0;
 }
 
+function playbackLength() {
+  const recordingDuration = playbackDuration(activeRecording || {});
+  if (recordingDuration > 0) return recordingDuration;
+  const videoDuration = Number(videoPlaybackInfo?.duration);
+  if (Number.isFinite(videoDuration) && videoDuration > 0) return videoDuration;
+  return Number.isFinite(playerVideo.duration) && playerVideo.duration > 0
+    ? playerVideo.duration
+    : 0;
+}
+
 function playbackPosition() {
   return usingTranscode || usingWasm
     ? transcodeBase + playerVideo.currentTime
@@ -108,7 +174,7 @@ function playbackPosition() {
 }
 
 function seekTo(seconds) {
-  const duration = playbackDuration(activeRecording || {});
+  const duration = playbackLength();
   const position = Math.max(0, Math.min(seconds, duration || Number.MAX_SAFE_INTEGER));
   if (usingWasm) {
     const buffered = Array.from({ length: playerVideo.buffered.length }, (_, index) => ({
@@ -159,11 +225,14 @@ function updateCommercialBreaks(markers) {
 
 async function refreshLiveRecording(recordedId) {
   if (activeRecording?.Recording?.RecordedId !== recordedId) return;
+  const controller = playerController;
   try {
-    const response = await fetch(appPath(`/api/playback/${recordedId}/live-status`));
+    const response = await fetch(appPath(`/api/playback/${recordedId}/live-status`), {
+      signal: controller.signal,
+    });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
     const status = await response.json();
-    if (activeRecording?.Recording?.RecordedId !== recordedId) return;
+    if (controller !== playerController || controller.signal.aborted) return;
     if (status.end_time) {
       activeRecording.EndTime = status.end_time;
       activeRecording.Recording.EndTs = status.end_time;
@@ -175,7 +244,9 @@ async function refreshLiveRecording(recordedId) {
       liveRecordingTimer = null;
     }
   } catch (error) {
-    playerStatus.textContent = `Could not refresh live recording status: ${error.message}`;
+    if (controller === playerController && !controller.signal.aborted) {
+      playerStatus.textContent = `Could not refresh live recording status: ${error.message}`;
+    }
   }
 }
 
@@ -189,8 +260,9 @@ function startLiveRecordingUpdates(recordedId) {
 }
 
 function updatePlaybackProgress() {
+  if ((!activeRecording && !activeVideo) || (activeRecording && !playbackReady)) return;
   const position = playbackPosition();
-  const duration = playbackDuration(activeRecording || {}) || playerVideo.duration || 0;
+  const duration = playbackLength();
   document.querySelector("#playback-elapsed").textContent = formatPlaybackTime(position);
   document.querySelector("#playback-duration").textContent = formatPlaybackTime(duration);
   playbackSeek.value = duration > 0 ? String(Math.round((position / duration) * 1000)) : "0";
@@ -200,20 +272,29 @@ function updatePlaybackProgress() {
 }
 
 async function savePlaybackPosition() {
-  if (!activeRecording) return;
-  const recordedId = activeRecording.Recording.RecordedId;
+  if ((!activeRecording && !activeVideo) || (activeRecording && !playbackReady)) return;
+  const generation = playerGeneration;
+  const recordedId = activeRecording?.Recording.RecordedId;
+  const videoId = activeVideo?.Id;
   const position = playbackPosition();
   if (!Number.isFinite(position) || position < 0) return;
   lastSavedPosition = position;
   try {
-    const response = await fetch(appPath(`/api/playback/${recordedId}/position`), {
+    const positionPath = videoId
+      ? `/api/videos/${videoId}/position`
+      : `/api/playback/${recordedId}/position`;
+    const response = await fetch(appPath(positionPath), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ position }),
+      keepalive: true,
     });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
   } catch (error) {
-    if (activeRecording?.Recording.RecordedId === recordedId) {
+  if (
+    generation === playerGeneration
+    && (activeRecording?.Recording.RecordedId === recordedId || activeVideo?.Id === videoId)
+  ) {
       lastSavedPosition = -1;
       playerStatus.textContent = `Could not save playback position: ${error.message}`;
     }
@@ -222,13 +303,15 @@ async function savePlaybackPosition() {
 
 async function cancelTranscode() {
   const token = transcodeToken;
-  if (!token || !activeRecording) return;
+  if (!token || (!activeRecording && !activeVideo)) return;
   transcodeToken = null;
-  const recordedId = activeRecording.Recording.RecordedId;
+  const cancelUrl = activeVideo
+    ? `/api/videos/${activeVideo.Id}/transcode/cancel`
+    : `/api/playback/${activeRecording.Recording.RecordedId}/transcode/cancel`;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       const response = await fetch(
-        appPath(`/api/playback/${recordedId}/transcode/cancel`),
+        appPath(cancelUrl),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -258,6 +341,11 @@ function createTranscodeToken() {
 }
 
 function startTranscode(seconds = 0) {
+  if (
+    (!activeRecording && !activeVideo)
+    || !playerController
+    || playerController.signal.aborted
+  ) return;
   stopWasmPlayback();
   cancelTranscode();
   usingWasm = false;
@@ -265,26 +353,47 @@ function startTranscode(seconds = 0) {
   transcodeBase = seconds;
   const playbackRate = Number(document.querySelector("#playback-speed").value) || 1;
   transcodeToken = createTranscodeToken();
+  const token = transcodeToken;
+  const generation = playerGeneration;
+  playbackReady = false;
   playerStatus.textContent = "Preparing a live browser-compatible stream…";
-  playerVideo.addEventListener("loadedmetadata", function restorePlaybackRate() {
-    playerVideo.removeEventListener("loadedmetadata", restorePlaybackRate);
+  waitForPlayerEvent("loadedmetadata", playerController.signal).then((ready) => {
+    if (!ready || generation !== playerGeneration || token !== transcodeToken) return;
+    playbackReady = true;
     playerVideo.playbackRate = playbackRate;
     if ("preservesPitch" in playerVideo) playerVideo.preservesPitch = true;
   });
   const selectedSubtitle = document.querySelector("#subtitle-track").value;
-  const dvbTrack = playbackInfo?.media.subtitles.find(
+  const dvbTrack = (activeRecording ? playbackInfo?.media.subtitles : [])?.find(
     (track) => String(track.index) === selectedSubtitle && track.codec === "dvb_subtitle",
   );
   burnedSubtitle = dvbTrack ? String(dvbTrack.index) : null;
   const subtitleQuery = burnedSubtitle === null ? "" : `&subtitle=${burnedSubtitle}`;
-  playerVideo.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/transcode?start=${encodeURIComponent(seconds)}&token=${transcodeToken}${subtitleQuery}`);
+  const transcodePath = activeVideo
+    ? `/api/videos/${activeVideo.Id}/transcode`
+    : `/api/playback/${activeRecording.Recording.RecordedId}/transcode`;
+  playerVideo.src = appPath(`${transcodePath}?start=${encodeURIComponent(seconds)}&token=${transcodeToken}${subtitleQuery}`);
   playerVideo.load();
+  if (subtitleElement) {
+    selectSubtitle(document.querySelector("#subtitle-track").value);
+  }
   playerVideo.play().catch(() => {
-    playerStatus.textContent = "Stream ready. Press Play to begin.";
+    if (generation === playerGeneration && token === transcodeToken) {
+      playerStatus.textContent = "Stream ready. Press Play to begin.";
+    }
   });
 }
 
 function handleVideoError() {
+  if (activeVideo) {
+    if (!usingTranscode) {
+      const position = playbackPosition();
+      startTranscode(Math.max(Number.isFinite(position) ? position : 0, requestedStartPosition));
+    } else {
+      playerStatus.textContent = "The server could not transcode this video.";
+    }
+    return;
+  }
   if (!activeRecording) return;
   if (!usingTranscode) {
     if (BROWSER_CONVERSION_ENABLED && !usingWasm) {
@@ -300,19 +409,27 @@ function handleVideoError() {
 async function selectSubtitle(streamIndex) {
   subtitleElement?.remove();
   subtitleElement = null;
-  if (!activeRecording) return;
-  const selectedTrack = playbackInfo.media.subtitles.find(
-    (track) => String(track.index) === streamIndex,
+  if (!activeRecording && !activeVideo) return;
+  const tracks = activeVideo
+    ? videoPlaybackInfo?.subtitles || []
+    : playbackInfo?.media.subtitles || [];
+  const trackInfo = tracks.find(
+    (track) => Number.isSafeInteger(track.index) && String(track.index) === streamIndex,
   );
-  if (selectedTrack?.codec === "dvb_subtitle" || burnedSubtitle !== null) {
-    startTranscode(Math.max(playbackPosition(), requestedStartPosition));
+  if (activeRecording && (trackInfo?.codec === "dvb_subtitle" || burnedSubtitle !== null)) {
+    const desiredSubtitle = trackInfo?.codec === "dvb_subtitle" ? String(trackInfo.index) : null;
+    if (desiredSubtitle !== burnedSubtitle) {
+      startTranscode(Math.max(playbackPosition(), requestedStartPosition));
+    }
   }
-  if (streamIndex === "" || selectedTrack?.codec === "dvb_subtitle") return;
-  const trackInfo = playbackInfo.media.subtitles.find(
-    (track) => String(track.index) === streamIndex,
-  );
-  if (!trackInfo) return;
+  if (!trackInfo || trackInfo.codec === "dvb_subtitle") return;
+  const resourceId = activeVideo
+    ? activeVideo.Id
+    : activeRecording.Recording.RecordedId;
+  if (!Number.isSafeInteger(resourceId) || resourceId <= 0) return;
+  const safeStreamIndex = trackInfo.index;
   const track = document.createElement("track");
+  const generation = playerGeneration;
   track.kind = "subtitles";
   track.label = trackInfo.title || (
     trackInfo.language && trackInfo.language !== "und"
@@ -320,12 +437,18 @@ async function selectSubtitle(streamIndex) {
       : `Track ${streamIndex}`
   );
   track.srclang = /^[a-z]{2,3}$/i.test(trackInfo.language) ? trackInfo.language : "und";
-  track.src = appPath(`/api/playback/${activeRecording.Recording.RecordedId}/subtitles/${streamIndex}`);
+  const subtitlePath = activeVideo
+    ? `/api/videos/${resourceId}/subtitles/${safeStreamIndex}`
+    : `/api/playback/${resourceId}/subtitles/${safeStreamIndex}`;
+  const subtitleStart = usingTranscode || usingWasm ? transcodeBase : 0;
+  track.src = appPath(`${subtitlePath}?start=${encodeURIComponent(subtitleStart)}`);
   track.addEventListener("load", () => {
+    if (generation !== playerGeneration || subtitleElement !== track) return;
     track.track.mode = "showing";
     playerStatus.textContent = `Subtitles: ${track.label}`;
   });
   track.addEventListener("error", () => {
+    if (generation !== playerGeneration || subtitleElement !== track) return;
     playerStatus.textContent = trackInfo.codec === "dvb_subtitle"
       ? "This DVB bitmap subtitle could not be converted to browser text subtitles."
       : `Could not load subtitle track: ${track.label}`;
@@ -336,6 +459,8 @@ async function selectSubtitle(streamIndex) {
 }
 
 async function startWasmTranscode(seconds = 0) {
+  if (!activeRecording) return;
+  const generation = playerGeneration;
   stopWasmPlayback();
   cancelTranscode();
   usingTranscode = false;
@@ -345,7 +470,7 @@ async function startWasmTranscode(seconds = 0) {
   playerStatus.textContent = "Preparing browser-side conversion…";
   try {
     const { startWasmPlayback } = await import("./browser_playback.js");
-    if (recording !== activeRecording) return;
+    if (generation !== playerGeneration || recording !== activeRecording) return;
     const session = await startWasmPlayback({
       sourceURL: appPath(`/api/playback/${recording.Recording.RecordedId}/stream`),
       coreURL: appPath("/static/vendor/ffmpeg-core.js"),
@@ -357,13 +482,19 @@ async function startWasmTranscode(seconds = 0) {
       sourceVideoProfile: playbackInfo.media.video_profile,
       sourceVideoLevel: playbackInfo.media.video_level,
       sourceVideoPixelFormat: playbackInfo.media.video_pixel_format,
-      onStatus: (status) => { playerStatus.textContent = status; },
+      onStatus: (status) => {
+        if (generation === playerGeneration && recording === activeRecording) playerStatus.textContent = status;
+      },
     });
-    if (recording !== activeRecording) {
+    if (generation !== playerGeneration || recording !== activeRecording) {
       session.cancel();
       return;
     }
     wasmPlayback = session;
+    playbackReady = true;
+    if (subtitleElement) {
+      selectSubtitle(document.querySelector("#subtitle-track").value);
+    }
     session.done.catch((error) => {
       if (wasmPlayback !== session || recording !== activeRecording) return;
       const position = playbackPosition();
@@ -371,10 +502,12 @@ async function startWasmTranscode(seconds = 0) {
       startTranscode(position);
     });
     playerVideo.play().catch(() => {
-      playerStatus.textContent = "Browser conversion ready. Press Play to begin.";
+      if (generation === playerGeneration && recording === activeRecording) {
+        playerStatus.textContent = "Browser conversion ready. Press Play to begin.";
+      }
     });
   } catch (error) {
-    if (recording === activeRecording) {
+    if (generation === playerGeneration && recording === activeRecording) {
       playerStatus.textContent = `Browser conversion unavailable; using server fallback: ${error.message}`;
       startTranscode(seconds);
     }
@@ -384,7 +517,21 @@ async function startWasmTranscode(seconds = 0) {
 async function openPlayer(program, startMode = "resume") {
   const recordedId = program.Recording?.RecordedId;
   if (!recordedId) return;
+  cancelTranscode();
+  playerController?.abort();
+  const controller = new AbortController();
+  playerController = controller;
+  const generation = ++playerGeneration;
+  const isCurrent = () => generation === playerGeneration && !controller.signal.aborted;
+  playbackReady = false;
   activeRecording = program;
+  activeVideo = null;
+  videoPlaybackInfo = null;
+  playerVideo.pause();
+  playerVideo.removeAttribute("src");
+  playerVideo.load();
+  subtitleElement?.remove();
+  subtitleElement = null;
   window.clearInterval(liveRecordingTimer);
   liveRecordingTimer = null;
   setForwardSkipMode(false);
@@ -392,12 +539,15 @@ async function openPlayer(program, startMode = "resume") {
   commercialBreaks = [];
   skipAdButton.hidden = true;
   skipAdButton.disabled = true;
+  document.querySelector(".smart-skip-control").hidden = false;
+  setBookmarkButton.disabled = false;
   usingTranscode = false;
   usingWasm = false;
   transcodeBase = 0;
   burnedSubtitle = null;
   stopWasmPlayback();
   lastSavedPosition = -1;
+  requestedStartPosition = 0;
   document.querySelector("#player-title").textContent = program.SubTitle || program.Title;
   document.querySelector("#player-subtitle").textContent = [
     program.Title,
@@ -410,13 +560,17 @@ async function openPlayer(program, startMode = "resume") {
   document.querySelector("#player-details").open = false;
   playerStatus.textContent = "Loading MythTV playback details…";
   playerReturnFocus = document.activeElement;
-  playerDialog.showModal();
+  if (!playerDialog.open) playerDialog.showModal();
   playerVideo.focus({ preventScroll: true });
 
   try {
-    const response = await fetch(appPath(`/api/playback/${recordedId}`));
+    const response = await fetch(appPath(`/api/playback/${recordedId}`), {
+      signal: controller.signal,
+    });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
-    playbackInfo = await response.json();
+    const info = await response.json();
+    if (!isCurrent()) return;
+    playbackInfo = info;
     if (playbackInfo.program) {
       activeRecording = {
         ...program,
@@ -456,55 +610,152 @@ async function openPlayer(program, startMode = "resume") {
       if (BROWSER_CONVERSION_ENABLED) startWasmTranscode(resumePosition);
       else startTranscode(resumePosition);
     } else {
-      const metadataReady = new Promise((resolve) => {
-        playerVideo.addEventListener("loadedmetadata", resolve, { once: true });
-      });
+      const metadataReady = waitForPlayerEvent("loadedmetadata", controller.signal);
       playerVideo.src = appPath(`/api/playback/${recordedId}/stream`);
       playerVideo.load();
-      await metadataReady;
+      const ready = await metadataReady;
+      if (!isCurrent() || usingTranscode || usingWasm) return;
+      if (!ready) throw new Error("Timed out loading recording metadata.");
       const duration = Number.isFinite(playerVideo.duration) ? playerVideo.duration : 0;
       const seekPosition = duration > 0
         ? Math.min(resumePosition, Math.max(0, duration - 0.5))
         : resumePosition;
       lastSavedPosition = seekPosition;
       if (seekPosition > 0.5) {
-        const seeked = new Promise((resolve) => {
-          playerVideo.addEventListener("seeked", resolve, { once: true });
-        });
+        const seeked = waitForPlayerEvent("seeked", controller.signal, 5000);
         playerVideo.currentTime = seekPosition;
-        if (playerVideo.seeking) {
-          await Promise.race([
-            seeked,
-            new Promise((resolve) => window.setTimeout(resolve, 5000)),
-          ]);
-        }
+        await seeked;
+        if (!isCurrent() || usingTranscode || usingWasm) return;
       }
+      playbackReady = true;
       updatePlaybackProgress();
       await playerVideo.play().then(() => {
+        if (!isCurrent()) return;
         requestedStartPosition = 0;
         playerStatus.textContent = commercialBreaks.length
           ? `${commercialBreaks.length} commercial break markers loaded`
           : "No commercial break markers are available for this recording.";
       }).catch(() => {
-        playerStatus.textContent = "Stream ready. Press Play to begin.";
+        if (isCurrent()) playerStatus.textContent = "Stream ready. Press Play to begin.";
       });
     }
   } catch (error) {
-    playerStatus.textContent = error.message;
+    if (isCurrent()) playerStatus.textContent = error.message;
   }
 }
 
-async function closePlayer() {
+async function openVideoPlayer(video) {
+  cancelTranscode();
+  playerController?.abort();
+  const controller = new AbortController();
+  playerController = controller;
+  const generation = ++playerGeneration;
+  const isCurrent = () => generation === playerGeneration && !controller.signal.aborted;
+  playbackReady = false;
+  activeVideo = video;
+  activeRecording = null;
+  playbackInfo = null;
+  videoPlaybackInfo = null;
+  playerVideo.pause();
+  playerVideo.removeAttribute("src");
+  playerVideo.load();
+  subtitleElement?.remove();
+  subtitleElement = null;
+  window.clearInterval(liveRecordingTimer);
+  liveRecordingTimer = null;
+  setForwardSkipMode(false);
+  playbackInfo = null;
+  commercialBreaks = [];
+  skipAdButton.hidden = true;
+  skipAdButton.disabled = true;
+  document.querySelector(".smart-skip-control").hidden = true;
+  usingTranscode = false;
+  usingWasm = false;
+  transcodeBase = 0;
+  requestedStartPosition = 0;
+  stopWasmPlayback();
+  playerVideo.controls = false;
+  playerShell.classList.add("video-playback");
+  document.querySelector("#player-title").textContent = video.Title || "Video";
+  document.querySelector("#player-subtitle").textContent = [
+    video.SubTitle,
+    video.ReleaseDate ? formatDate(video.ReleaseDate) : "",
+    video.Length ? `${video.Length} min` : "",
+  ].filter(Boolean).join(" · ");
+  document.querySelector("#player-description").textContent =
+    video.Description || "No video description is available.";
+  document.querySelector("#subtitle-track").replaceChildren(new Option("Off", ""));
+  document.querySelector("#player-details summary").textContent = "Video details";
+  document.querySelector("#player-details").open = false;
+  playerStatus.textContent = "Loading MythTV video details…";
+  playerReturnFocus = document.activeElement;
+  playerDialog.showModal();
+  playerVideo.focus({ preventScroll: true });
+
+  try {
+    const response = await fetch(appPath(`/api/videos/${video.Id}/playback`), {
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Request failed (${response.status})`);
+    videoPlaybackInfo = await response.json();
+  } catch (error) {
+    playerStatus.textContent = `Could not load video playback details: ${error.message}`;
+    videoPlaybackInfo = { duration: null, frame_rate: null, last_position: 0, bookmark: 0, subtitles: [] };
+  }
+  if (!isCurrent()) return;
+  const subtitleSelect = document.querySelector("#subtitle-track");
+  videoPlaybackInfo.subtitles.forEach((track) => {
+    const label = track.title || (
+      track.language && track.language !== "und" ? track.language : `Track ${track.index}`
+    );
+    subtitleSelect.add(new Option(label, String(track.index)));
+  });
+  const duration = Number(videoPlaybackInfo.duration);
+  const resumePosition = Number(videoPlaybackInfo.last_position) || 0;
+  requestedStartPosition = resumePosition;
+  lastSavedPosition = resumePosition;
+  document.querySelector("#playback-duration").textContent = formatPlaybackTime(
+    duration > 0 ? duration : 0,
+  );
+  setBookmarkButton.disabled = !videoPlaybackInfo.frame_rate;
+  playerVideo.addEventListener("loadedmetadata", function resumeVideo() {
+    if (!isCurrent()) return;
+    const mediaDuration = Number.isFinite(playerVideo.duration) ? playerVideo.duration : duration;
+    const seekPosition = mediaDuration > 0
+      ? Math.min(resumePosition, Math.max(0, mediaDuration - 0.5))
+      : resumePosition;
+    if (seekPosition > 0.5) playerVideo.currentTime = seekPosition;
+    requestedStartPosition = 0;
+    updatePlaybackProgress();
+  }, { once: true });
+  playerVideo.src = appPath(`/api/videos/${video.Id}/stream`);
+  playerVideo.load();
+  playerVideo.play().catch(() => {
+    playerStatus.textContent = "Video ready. Press Play to begin.";
+  });
+}
+
+function closePlayer() {
   if (document.fullscreenElement === playerShell) {
     document.exitFullscreen().catch((error) => {
       playerStatus.textContent = `Could not exit fullscreen: ${error.message}`;
     });
   }
-  if (!activeRecording) return;
+  if (!activeRecording && !activeVideo) return;
+  setTheaterMode(false);
+  if (document.pictureInPictureElement === playerVideo && document.exitPictureInPicture) {
+    document.exitPictureInPicture().catch((error) => {
+      playerStatus.textContent = `Could not reattach player: ${error.message}`;
+    });
+  }
+  savePlaybackPosition();
+  playerController?.abort();
+  playerController = null;
+  playerGeneration += 1;
+  playbackReady = false;
   window.clearInterval(liveRecordingTimer);
   liveRecordingTimer = null;
   setForwardSkipMode(false);
-  await savePlaybackPosition();
   cancelTranscode();
   stopWasmPlayback();
   playerVideo.pause();
@@ -513,7 +764,9 @@ async function closePlayer() {
   subtitleElement?.remove();
   subtitleElement = null;
   activeRecording = null;
+  activeVideo = null;
   playbackInfo = null;
+  videoPlaybackInfo = null;
   commercialBreaks = [];
   usingTranscode = false;
   usingWasm = false;
@@ -521,6 +774,11 @@ async function closePlayer() {
   burnedSubtitle = null;
   requestedStartPosition = 0;
   if (playerDialog.open) playerDialog.close();
+  playerVideo.controls = false;
+  document.querySelector(".smart-skip-control").hidden = false;
+  setBookmarkButton.disabled = false;
+  document.querySelector("#player-details summary").textContent = "Program details";
+  playerShell.classList.remove("video-playback");
   const returnFocus = playerReturnFocus;
   playerReturnFocus = null;
   if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
@@ -563,6 +821,284 @@ function previewUrl(program) {
     : "";
 }
 
+function makeVideoCard(video, index) {
+  const card = document.createElement("article");
+  card.className = "program-card";
+  card.style.animationDelay = `${Math.min(index % 8, 8) * 22}ms`;
+  const artwork = artworkInfo(video, "coverart");
+  const poster = makePoster(
+    artwork?.URL || "",
+    video.Watched ? "Watched" : "",
+    `/api/video-preview/${video.Id}`,
+    artwork?.Type || "coverart",
+  );
+  poster.classList.add("video-poster");
+  const playButton = document.createElement("button");
+  playButton.className = "recording-poster-button";
+  playButton.type = "button";
+  playButton.setAttribute("aria-label", `Play ${video.Title || "video"}`);
+  playButton.title = "Play video";
+  playButton.append(poster);
+  const playIcon = document.createElement("span");
+  playIcon.className = "poster-play-mark";
+  playIcon.setAttribute("aria-hidden", "true");
+  setSvgIcon(playIcon, "", "0 0 24 24", ["m8 5 12 7-12 7z"]);
+  playButton.append(playIcon);
+  playButton.addEventListener("click", () => openVideoPlayer(video));
+
+  const info = document.createElement("div");
+  info.className = "program-info program-info-overlay";
+  const category = document.createElement("p");
+  category.className = "program-channel";
+  category.textContent = video.ContentType || "Video";
+  const title = document.createElement("h2");
+  title.className = "program-title";
+  title.textContent = video.Title || "Untitled video";
+  const subtitle = document.createElement("p");
+  subtitle.className = "program-subtitle";
+  subtitle.textContent = [episodeLabel(video), video.SubTitle || video.Director]
+    .filter(Boolean)
+    .join(" · ") || " ";
+  const description = document.createElement("p");
+  description.className = "program-description";
+  description.textContent = video.Description || "";
+  const meta = document.createElement("div");
+  meta.className = "program-meta";
+  if (video.ReleaseDate) {
+    const releaseDate = document.createElement("time");
+    releaseDate.dateTime = video.ReleaseDate;
+    releaseDate.textContent = formatDate(video.ReleaseDate);
+    meta.append(releaseDate);
+  }
+  if (video.Length) meta.append(document.createTextNode(`${video.Length} min`));
+  info.append(category, title, subtitle, description, meta);
+  poster.append(info);
+
+  const actions = document.createElement("div");
+  actions.className = "recording-actions";
+  actions.setAttribute("role", "group");
+  actions.setAttribute("aria-label", "Video actions");
+  actions.append(makeRecordingAction(
+    video.Watched ? "Mark unwatched" : "Mark watched",
+    video.Watched
+      ? ["M4 12a8 8 0 1 0 2.34-5.66L4 8.5", "M4 4v4.5h4.5"]
+      : ["m5 12 4 4L19 6"],
+    () => updateVideoWatched(video),
+  ));
+  card.append(playButton, actions);
+  return card;
+}
+
+function videoMatchesFilters(video, query) {
+  const watched = Boolean(video.Watched);
+  const matchesFilter = activeVideoFilter === "all"
+    || (activeVideoFilter === "watched" && watched)
+    || (activeVideoFilter === "unwatched" && !watched);
+  const searchable = [
+    video.Title,
+    video.SubTitle,
+    video.Description,
+    video.Director,
+    video.ContentType,
+    video.FileName,
+    episodeLabel(video),
+  ].filter(Boolean).join(" ").toLocaleLowerCase();
+  return matchesFilter && (!query || searchable.includes(query));
+}
+
+function makeVideoDirectoryTree() {
+  const root = { name: "", path: [], children: new Map(), videos: [] };
+  for (const video of videos) {
+    const segments = String(video.FileName || "")
+      .replaceAll("\\", "/")
+      .split("/")
+      .filter(Boolean);
+    segments.pop();
+    let directory = root;
+    for (const segment of segments) {
+      if (!directory.children.has(segment)) {
+        directory.children.set(segment, {
+          name: segment,
+          path: [...directory.path, segment],
+          children: new Map(),
+          videos: [],
+        });
+      }
+      directory = directory.children.get(segment);
+    }
+    directory.videos.push(video);
+  }
+  return root;
+}
+
+function summarizeVideoDirectory(directory, query) {
+  directory.visibleVideos = directory.videos.filter((video) =>
+    videoMatchesFilters(video, query),
+  );
+  directory.matchingVideos = directory.visibleVideos.length;
+  directory.matchingDirectories = 0;
+  for (const child of directory.children.values()) {
+    summarizeVideoDirectory(child, query);
+    if (child.matchingVideos > 0) {
+      directory.matchingVideos += child.matchingVideos;
+      directory.matchingDirectories += 1;
+    }
+  }
+}
+
+function findVideoDirectory(root, path) {
+  return path.reduce((directory, segment) => directory?.children.get(segment), root);
+}
+
+function makeVideoFolderCard(directory, index) {
+  const card = document.createElement("article");
+  card.className = "program-card video-folder-card";
+  card.style.animationDelay = `${Math.min(index % 8, 8) * 22}ms`;
+  const button = document.createElement("button");
+  button.className = "video-folder-button";
+  button.type = "button";
+  button.setAttribute("aria-label", `Open folder ${directory.name}, ${directory.matchingVideos} videos`);
+  setSvgIcon(button, "video-folder-icon", "0 0 32 26", [
+    "M2 5.5A2.5 2.5 0 0 1 4.5 3h7l3 3h13A2.5 2.5 0 0 1 30 8.5v13a2.5 2.5 0 0 1-2.5 2.5h-21A4.5 4.5 0 0 1 2 19.5z",
+  ]);
+  const name = document.createElement("h2");
+  name.className = "video-folder-name";
+  name.textContent = directory.name;
+  const parent = document.createElement("p");
+  parent.className = "video-folder-parent";
+  parent.textContent = directory.path.length > 1
+    ? directory.path.slice(0, -1).join(" / ")
+    : "Top-level folder";
+  const counts = document.createElement("p");
+  counts.className = "video-folder-counts";
+  const folderLabel = `${directory.matchingDirectories} ${directory.matchingDirectories === 1 ? "subfolder" : "subfolders"}`;
+  const videoLabel = `${directory.matchingVideos} ${directory.matchingVideos === 1 ? "video" : "videos"}`;
+  counts.textContent = `${folderLabel} · ${videoLabel}`;
+  button.append(name, parent, counts);
+  button.addEventListener("click", () => {
+    videoDirectoryScrollPositions.set(
+      JSON.stringify(videoDirectoryPath),
+      window.scrollY,
+    );
+    videoDirectoryPath = directory.path;
+    renderVideos();
+    window.scrollTo({ top: 0, behavior: "instant" });
+  });
+  card.append(button);
+  return card;
+}
+
+function renderVideoBreadcrumb() {
+  const breadcrumb = document.querySelector("#video-breadcrumb");
+  breadcrumb.replaceChildren();
+  breadcrumb.hidden = activeVideoMode !== "folders";
+  if (breadcrumb.hidden) return;
+
+  const crumbs = [{ label: "All videos", path: [] }];
+  videoDirectoryPath.forEach((segment, index) => {
+    crumbs.push({ label: segment, path: videoDirectoryPath.slice(0, index + 1) });
+  });
+  crumbs.forEach((crumb, index) => {
+    if (index > 0) {
+      const separator = document.createElement("span");
+      separator.textContent = "/";
+      separator.setAttribute("aria-hidden", "true");
+      breadcrumb.append(separator);
+    }
+    const button = document.createElement("button");
+    button.className = "video-crumb";
+    button.type = "button";
+    button.textContent = crumb.label;
+    if (index === crumbs.length - 1) button.setAttribute("aria-current", "page");
+    button.addEventListener("click", () => {
+      videoDirectoryPath = crumb.path;
+      renderVideos();
+      window.scrollTo({
+        top: videoDirectoryScrollPositions.get(JSON.stringify(crumb.path)) || 0,
+        behavior: "instant",
+      });
+    });
+    breadcrumb.append(button);
+  });
+}
+
+function renderVideos() {
+  const query = document.querySelector("#video-search").value.trim().toLocaleLowerCase();
+  const directoryRoot = makeVideoDirectoryTree();
+  summarizeVideoDirectory(directoryRoot, query);
+  if (!findVideoDirectory(directoryRoot, videoDirectoryPath)) videoDirectoryPath = [];
+  const currentDirectory = findVideoDirectory(directoryRoot, videoDirectoryPath);
+  const visibleVideos = activeVideoMode === "folders"
+    ? currentDirectory.visibleVideos
+    : videos.filter((video) => videoMatchesFilters(video, query));
+  const visibleDirectories = activeVideoMode === "folders"
+    ? [...currentDirectory.children.values()]
+      .filter((directory) => directory.matchingVideos > 0)
+      .sort((left, right) => left.name.localeCompare(
+        right.name,
+        undefined,
+        { numeric: true, sensitivity: "base" },
+      ))
+    : [];
+  const videoGrid = document.querySelector("#video-grid");
+  videoGrid.replaceChildren(
+    ...visibleDirectories.map(makeVideoFolderCard),
+    ...visibleVideos.map(makeVideoCard),
+  );
+  renderVideoBreadcrumb();
+  const visibleCount = visibleDirectories.length + visibleVideos.length;
+  document.querySelector("#videos-empty-state").hidden = visibleCount > 0;
+  document.querySelector("#videos-empty-title").textContent = videos.length
+    ? "No matching videos"
+    : "No videos found";
+  document.querySelector("#videos-empty-description").textContent = videos.length
+    ? "Try another search or change the watched filter."
+    : "There are no videos available from the MythTV backend.";
+  document.querySelector("#videos-total").textContent = videos.length.toLocaleString();
+  document.querySelector("#videos-result-note").textContent = activeVideoMode === "folders"
+    ? `${visibleDirectories.length} folders · ${visibleVideos.length} videos in this directory · ${currentDirectory.matchingVideos} matching videos below`
+    : `Showing ${visibleVideos.length} of ${videos.length} videos`;
+}
+
+async function loadVideos() {
+  const videoGrid = document.querySelector("#video-grid");
+  const status = document.querySelector("#videos-sync-note");
+  videoGrid.setAttribute("aria-busy", "true");
+  status.textContent = "Loading videos…";
+  try {
+    const response = await fetch(appPath("/api/videos"));
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
+    videos = result.videos;
+    status.textContent = "Connected to MythTV";
+    renderVideos();
+  } catch (error) {
+    status.textContent = "MythTV backend unavailable";
+    document.querySelector("#videos-empty-state").hidden = false;
+    document.querySelector("#videos-empty-title").textContent = "Can’t reach MythTV";
+    document.querySelector("#videos-empty-description").textContent = error.message;
+  } finally {
+    videoGrid.setAttribute("aria-busy", "false");
+  }
+}
+
+async function updateVideoWatched(video) {
+  const watched = !video.Watched;
+  try {
+    const response = await fetch(appPath(`/api/videos/${video.Id}/watched`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ watched }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
+    video.Watched = result.watched;
+    renderVideos();
+  } catch (error) {
+    document.querySelector("#videos-sync-note").textContent = error.message;
+  }
+}
+
 function makePoster(sourceUrl, badgeText = "", fallbackUrl = "", artworkType = "") {
   sourceUrl = sourceUrl || "";
   const poster = document.createElement("div");
@@ -572,14 +1108,17 @@ function makePoster(sourceUrl, badgeText = "", fallbackUrl = "", artworkType = "
   fallback.className = "poster-fallback";
   fallback.textContent = "M";
   poster.append(fallback);
+  const fallbackSource = fallbackUrl ? appLocalPath(fallbackUrl) : "";
 
   if (sourceUrl || fallbackUrl) {
     const imageSource = sourceUrl.startsWith("/api/artwork?")
-      ? appPath(sourceUrl)
+      ? appLocalPath(sourceUrl)
+      : sourceUrl.startsWith("/api/video-preview/")
+        ? appLocalPath(sourceUrl)
       : sourceUrl.startsWith("/Content/GetImageFile?")
-        ? appPath(`/api/artwork?url=${encodeURIComponent(sourceUrl)}`)
-        : fallbackUrl
-          ? appPath(fallbackUrl)
+        ? appLocalPath(`/api/artwork?url=${encodeURIComponent(sourceUrl)}`)
+        : fallbackSource
+          ? fallbackSource
           : "";
     if (imageSource) {
       const image = document.createElement("img");
@@ -589,8 +1128,8 @@ function makePoster(sourceUrl, badgeText = "", fallbackUrl = "", artworkType = "
       image.addEventListener("load", () => fallback.remove(), { once: true });
       image.addEventListener("error", () => {
         poster.classList.remove("poster-coverart");
-        if (fallbackUrl && image.src !== new URL(fallbackUrl, location.href).href) {
-          image.src = fallbackUrl;
+        if (fallbackSource && image.src !== new URL(fallbackSource, location.href).href) {
+          image.src = fallbackSource;
         } else {
           image.remove();
         }
@@ -608,13 +1147,30 @@ function makePoster(sourceUrl, badgeText = "", fallbackUrl = "", artworkType = "
   return poster;
 }
 
-function makeRecordingAction(label, iconMarkup, handler) {
+function makeRecordingAction(label, iconParts, handler) {
   const button = document.createElement("button");
   button.className = "recording-action";
   button.type = "button";
   button.setAttribute("aria-label", label);
   button.title = label;
-  button.innerHTML = `<svg class="recording-action-icon" viewBox="0 0 24 24" aria-hidden="true">${iconMarkup}</svg>`;
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("class", "recording-action-icon");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("aria-hidden", "true");
+  for (const part of iconParts) {
+    if (typeof part === "string") {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", part);
+      icon.append(path);
+    } else {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", part.x);
+      text.setAttribute("y", part.y);
+      text.textContent = part.text;
+      icon.append(text);
+    }
+  }
+  button.append(icon);
   button.addEventListener("click", handler);
   return button;
 }
@@ -710,7 +1266,7 @@ function makeProgramCard(program, index) {
   const posterPlayIcon = document.createElement("span");
   posterPlayIcon.className = "poster-play-mark";
   posterPlayIcon.setAttribute("aria-hidden", "true");
-  posterPlayIcon.innerHTML = '<svg viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z" /></svg>';
+  setSvgIcon(posterPlayIcon, "", "0 0 24 24", ["m8 5 12 7-12 7z"]);
   posterButton.append(posterPlayIcon);
   posterButton.addEventListener("click", () => openPlayer(program, "resume"));
 
@@ -746,19 +1302,23 @@ function makeProgramCard(program, index) {
   const recordingActions = [
     makeRecordingAction(
       "Play from beginning",
-      '<path d="M5 5v14l11-7zM19 7a8 8 0 1 1-2-2" /><path d="M19 3v4h-4" /><text x="11" y="16">0</text>',
+      [
+        "M5 5v14l11-7zM19 7a8 8 0 1 1-2-2",
+        "M19 3v4h-4",
+        { x: "11", y: "16", text: "0" },
+      ],
       () => openPlayer(program, "beginning"),
     ),
     makeRecordingAction(
       "Play from bookmark",
-      '<path d="M6 3h12v18l-6-4-6 4z" />',
+      ["M6 3h12v18l-6-4-6 4z"],
       () => openPlayer(program, "bookmark"),
     ),
   ];
   if (deleteDialog && CAN_DELETE) {
     recordingActions.push(makeRecordingAction(
       "Delete recording",
-      '<path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3" />',
+      ["M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3"],
       () => showDeleteDialog(program),
     ));
   }
@@ -874,6 +1434,7 @@ async function loadGroups() {
 
 async function loadGroup(group) {
   if (loading) return;
+  recordingGroupsScrollY = window.scrollY;
   loading = true;
   grid.setAttribute("aria-busy", "true");
   syncNote.textContent = "Loading recordings…";
@@ -906,9 +1467,34 @@ function returnToGroups() {
   currentPrograms = [];
   searchInput.value = "";
   renderGroups();
+  window.scrollTo({ top: recordingGroupsScrollY, behavior: "instant" });
 }
 
 searchInput.addEventListener("input", renderCurrentView);
+document.querySelector("#video-search").addEventListener("input", renderVideos);
+document.querySelectorAll("[data-video-filter]").forEach((button) => {
+  button.addEventListener("click", () => {
+    activeVideoFilter = button.dataset.videoFilter;
+    document.querySelectorAll("[data-video-filter]").forEach((item) => {
+      const selected = item === button;
+      item.classList.toggle("selected", selected);
+      item.setAttribute("aria-pressed", String(selected));
+    });
+    renderVideos();
+  });
+});
+document.querySelectorAll("[data-video-mode]").forEach((button) => {
+  button.addEventListener("click", () => {
+    activeVideoMode = button.dataset.videoMode;
+    videoDirectoryPath = [];
+    document.querySelectorAll("[data-video-mode]").forEach((item) => {
+      const selected = item === button;
+      item.classList.toggle("selected", selected);
+      item.setAttribute("aria-pressed", String(selected));
+    });
+    renderVideos();
+  });
+});
 document.querySelectorAll(".filter-button").forEach((button) => {
   button.addEventListener("click", () => {
     activeFilter = button.dataset.filter;
@@ -998,20 +1584,22 @@ playerVideo.addEventListener("play", () => {
   const button = document.querySelector("#player-toggle");
   button.setAttribute("aria-label", "Pause");
   button.title = "Pause";
-  button.innerHTML = '<svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14" /></svg>';
+  setSvgIcon(button, "player-icon", "0 0 24 24", ["M8 5v14M16 5v14"]);
 });
 playerVideo.addEventListener("pause", () => {
   const button = document.querySelector("#player-toggle");
   button.setAttribute("aria-label", "Play");
   button.title = "Play";
-  button.innerHTML = '<svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7z" /></svg>';
+  setSvgIcon(button, "player-icon", "0 0 24 24", ["m8 5 12 7-12 7z"]);
 });
 playerVideo.addEventListener("playing", () => {
   playerStatus.textContent = usingWasm
     ? "Playing browser-side conversion"
     : usingTranscode
       ? "Playing live server conversion"
-      : "Playing MythTV recording";
+      : activeVideo
+        ? "Playing MythTV video"
+        : "Playing MythTV recording";
 });
 playerVideo.addEventListener("error", handleVideoError);
 playerVideo.addEventListener("timeupdate", () => {
@@ -1051,38 +1639,76 @@ skipAdButton.addEventListener("click", () => {
   if (marker) seekTo(marker.end + 0.25);
 });
 playbackSeek.addEventListener("input", () => {
-  const duration = playbackDuration(activeRecording || {}) || playerVideo.duration || 0;
+  const duration = playbackLength();
   document.querySelector("#playback-elapsed").textContent = formatPlaybackTime(
     (Number(playbackSeek.value) / 1000) * duration,
   );
 });
 playbackSeek.addEventListener("change", () => {
-  const duration = playbackDuration(activeRecording || {}) || playerVideo.duration || 0;
+  const duration = playbackLength();
   seekTo((Number(playbackSeek.value) / 1000) * duration);
 });
 document.querySelector("#playback-speed").addEventListener("change", (event) => {
   playerVideo.playbackRate = Number(event.currentTarget.value);
   if ("preservesPitch" in playerVideo) playerVideo.preservesPitch = true;
 });
+function updatePlayerVolumeControls() {
+  if (playerVideo.volume > 0) lastNonzeroVolume = playerVideo.volume;
+  playerVolume.value = String(playerVideo.volume);
+  const muted = playerVideo.muted || playerVideo.volume === 0;
+  playerMute.setAttribute("aria-label", muted ? "Unmute" : "Mute");
+  playerMute.title = muted ? "Unmute" : "Mute";
+  setSvgIcon(
+    playerMute,
+    "player-icon",
+    "0 0 24 24",
+    muted
+      ? ["M11 5 6 9H3v6h3l5 4V5Z", "m16 9 5 6m0-6-5 6"]
+      : ["M11 5 6 9H3v6h3l5 4V5Z", "M15.5 8.5a5 5 0 0 1 0 7m3-10a9 9 0 0 1 0 13"],
+  );
+}
+playerVolume.addEventListener("input", (event) => {
+  playerVideo.volume = Number(event.currentTarget.value);
+  if (playerVideo.volume > 0) playerVideo.muted = false;
+});
+playerMute.addEventListener("click", () => {
+  if (playerVideo.muted || playerVideo.volume === 0) {
+    if (playerVideo.volume === 0) playerVideo.volume = lastNonzeroVolume;
+    playerVideo.muted = false;
+  } else {
+    lastNonzeroVolume = playerVideo.volume;
+    playerVideo.muted = true;
+  }
+});
+playerVideo.addEventListener("volumechange", updatePlayerVolumeControls);
+updatePlayerVolumeControls();
 setBookmarkButton.addEventListener("click", async () => {
-  if (!activeRecording) return;
-  const recordedId = activeRecording.Recording.RecordedId;
+  if (!activeRecording && !activeVideo) return;
+  const generation = playerGeneration;
+  const videoId = activeVideo?.Id;
+  const recordedId = activeRecording?.Recording.RecordedId;
+  const bookmarkPath = videoId
+    ? `/api/videos/${videoId}/bookmark`
+    : `/api/playback/${recordedId}/bookmark`;
   const position = playbackPosition();
   setBookmarkButton.disabled = true;
   try {
-    const response = await fetch(appPath(`/api/playback/${recordedId}/bookmark`), {
+    const response = await fetch(appPath(bookmarkPath), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ position }),
     });
     const result = await response.json();
+    if (generation !== playerGeneration) return;
     if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
-    if (activeRecording?.Recording.RecordedId === recordedId && playbackInfo) {
+    if (activeVideo?.Id === videoId && videoPlaybackInfo) {
+      videoPlaybackInfo.bookmark = position;
+    } else if (activeRecording?.Recording.RecordedId === recordedId && playbackInfo) {
       playbackInfo.bookmark = Math.round(position * 1000);
     }
     playerStatus.textContent = `MythTV bookmark set at ${formatPlaybackTime(position)}`;
   } catch (error) {
-    playerStatus.textContent = `Could not set MythTV bookmark: ${error.message}`;
+    if (generation === playerGeneration) playerStatus.textContent = `Could not set MythTV bookmark: ${error.message}`;
   } finally {
     setBookmarkButton.disabled = false;
   }
@@ -1090,32 +1716,106 @@ setBookmarkButton.addEventListener("click", async () => {
 document.querySelector("#subtitle-track").addEventListener("change", (event) => {
   selectSubtitle(event.currentTarget.value);
 });
-function updateFullscreenControls() {
-  const fullscreen = document.fullscreenElement === playerShell;
-  document.querySelector("#player-fullscreen").hidden = fullscreen;
-  document.querySelector("#player-exit-fullscreen").hidden = !fullscreen;
-  playerShell.classList.toggle("controls-visible", fullscreen);
-  window.clearTimeout(controlsHideTimer);
-  if (fullscreen) {
-    revealFullscreenControls();
-  }
+function isExpandedPlayer() {
+  return (
+    document.fullscreenElement === playerShell
+    || playerShell.classList.contains("theater-mode")
+  );
 }
 
-function revealFullscreenControls() {
-  if (document.fullscreenElement !== playerShell) return;
+function updatePictureInPictureButton() {
+  const supported = (
+    document.pictureInPictureEnabled
+    && typeof playerVideo.requestPictureInPicture === "function"
+    && typeof document.exitPictureInPicture === "function"
+  );
+  const active = document.pictureInPictureElement === playerVideo;
+  const fullscreen = document.fullscreenElement === playerShell;
+  const label = !supported
+    ? "Picture-in-Picture is not supported"
+    : fullscreen
+      ? "Exit fullscreen to detach player"
+      : active
+        ? "Return player from Picture-in-Picture"
+        : "Detach player with Picture-in-Picture";
+  playerDetachButton.disabled = !supported || fullscreen;
+  playerDetachButton.setAttribute("aria-label", label);
+  playerDetachButton.setAttribute("aria-pressed", String(active));
+  playerDetachButton.title = label;
+}
+
+function updateFullscreenControls() {
+  const fullscreen = document.fullscreenElement === playerShell;
+  if (fullscreen) {
+    playerShell.classList.remove("theater-mode");
+    playerDialog.classList.remove("theater-mode");
+  }
+  const theater = playerShell.classList.contains("theater-mode");
+  document.querySelector("#player-fullscreen").hidden = fullscreen;
+  document.querySelector("#player-exit-fullscreen").hidden = !fullscreen;
+  playerTheaterButton.hidden = fullscreen || theater;
+  playerExitTheaterButton.hidden = !theater || fullscreen;
+  playerShell.classList.toggle("controls-visible", fullscreen || theater);
+  window.clearTimeout(controlsHideTimer);
+  updatePictureInPictureButton();
+  if (fullscreen || theater) revealExpandedPlayerControls();
+}
+
+function setTheaterMode(enabled) {
+  const theater = Boolean(enabled && document.fullscreenElement !== playerShell);
+  playerShell.classList.toggle("theater-mode", theater);
+  playerDialog.classList.toggle("theater-mode", theater);
+  updateFullscreenControls();
+}
+
+function revealExpandedPlayerControls() {
+  if (!isExpandedPlayer()) return;
   playerShell.classList.add("controls-visible");
   window.clearTimeout(controlsHideTimer);
   controlsHideTimer = window.setTimeout(() => {
     if (playerOverlay.contains(document.activeElement)) return;
-    playerShell.classList.remove("controls-visible");
+    if (isExpandedPlayer()) playerShell.classList.remove("controls-visible");
   }, 2500);
 }
+
+async function togglePictureInPicture() {
+  if (
+    !document.pictureInPictureEnabled
+    || typeof playerVideo.requestPictureInPicture !== "function"
+    || typeof document.exitPictureInPicture !== "function"
+  ) {
+    playerStatus.textContent = "Picture-in-Picture is not supported by this browser.";
+    return;
+  }
+  if (document.fullscreenElement === playerShell) {
+    playerStatus.textContent = "Exit fullscreen before detaching the player.";
+    return;
+  }
+  try {
+    if (document.pictureInPictureElement === playerVideo) {
+      await document.exitPictureInPicture();
+    } else {
+      setTheaterMode(false);
+      await playerVideo.requestPictureInPicture();
+    }
+  } catch (error) {
+    playerStatus.textContent = `Could not detach player: ${error.message}`;
+  }
+  updatePictureInPictureButton();
+}
+
+playerTheaterButton.addEventListener("click", () => setTheaterMode(true));
+playerExitTheaterButton.addEventListener("click", () => setTheaterMode(false));
+playerDetachButton.addEventListener("click", togglePictureInPicture);
+playerVideo.addEventListener("enterpictureinpicture", updatePictureInPictureButton);
+playerVideo.addEventListener("leavepictureinpicture", updatePictureInPictureButton);
 
 document.querySelector("#player-fullscreen").addEventListener("click", () => {
   if (!playerShell.requestFullscreen) {
     playerStatus.textContent = "Fullscreen is not supported by this browser.";
     return;
   }
+  setTheaterMode(false);
   playerShell.requestFullscreen()
     .then(updateFullscreenControls)
     .catch((error) => { playerStatus.textContent = `Could not enter fullscreen: ${error.message}`; });
@@ -1126,14 +1826,15 @@ document.querySelector("#player-exit-fullscreen").addEventListener("click", () =
   }
 });
 document.addEventListener("fullscreenchange", updateFullscreenControls);
-playerShell.addEventListener("pointermove", revealFullscreenControls);
-playerShell.addEventListener("pointerdown", revealFullscreenControls);
-playerShell.addEventListener("touchstart", revealFullscreenControls, { passive: true });
-playerShell.addEventListener("keydown", revealFullscreenControls);
-playerShell.addEventListener("focusin", revealFullscreenControls);
+playerShell.addEventListener("pointermove", revealExpandedPlayerControls);
+playerShell.addEventListener("pointerdown", revealExpandedPlayerControls);
+playerShell.addEventListener("touchstart", revealExpandedPlayerControls, { passive: true });
+playerShell.addEventListener("keydown", revealExpandedPlayerControls);
+playerShell.addEventListener("focusin", revealExpandedPlayerControls);
 playerOverlay.addEventListener("focusout", (event) => {
-  if (!playerOverlay.contains(event.relatedTarget)) revealFullscreenControls();
+  if (!playerOverlay.contains(event.relatedTarget)) revealExpandedPlayerControls();
 });
+updateFullscreenControls();
 
 function focusPlayerControlInDirection(current, direction) {
   const selector = "button:not(:disabled):not([hidden]), input:not(:disabled), select:not(:disabled), summary, video[tabindex]";
@@ -1194,7 +1895,9 @@ document.addEventListener("keydown", (event) => {
     }
   } else if (event.key === "/" && document.activeElement !== searchInput) {
     event.preventDefault();
-    searchInput.focus();
+    (document.querySelector('[data-view-panel="videos"]').hidden
+      ? searchInput
+      : document.querySelector("#video-search")).focus();
   } else if (event.key === "Escape" && selectedGroupTitle) {
     returnToGroups();
   }
@@ -2091,6 +2794,7 @@ function activateView(name) {
   const selectedButton = viewButtons.find((button) => button.dataset.view === name);
   document.title = `${selectedButton?.textContent.trim() || "Recordings"} | MythTV`;
   if (name === "recordings") loadGroups();
+  if (name === "videos") loadVideos();
   if (name === "live") loadGuide(true);
   if (name === "upcoming") {
     const upcomingButton = viewButtons.find((button) => button.dataset.view === "upcoming");

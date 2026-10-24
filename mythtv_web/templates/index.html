@@ -16,6 +16,7 @@
       </a>
       <nav aria-label="Main navigation">
         <button class="nav-link active" type="button" data-view="recordings" aria-current="page">Recordings</button>
+        <button class="nav-link" type="button" data-view="videos">Videos</button>
         <button class="nav-link" type="button" data-view="live">Live TV</button>
         <button class="nav-link" type="button" data-view="upcoming">Upcoming</button>
         <button class="nav-link" type="button" data-view="guide">Guide</button>
@@ -62,6 +63,41 @@
         <span class="empty-mark" aria-hidden="true">—</span>
         <h2 id="empty-title">No recordings found</h2>
         <p id="empty-description">Try another search or change the watched filter.</p>
+      </div>
+    </main>
+
+    <main class="library-shell" data-view-panel="videos" hidden>
+      <section class="library-heading" aria-labelledby="videos-title">
+        <div>
+          <p class="eyebrow">MythTV Backend <span>/</span> Video Library</p>
+          <h1 id="videos-title">Videos</h1>
+          <p class="library-summary"><strong id="videos-total">--</strong> <span>videos</span></p>
+        </div>
+        <div class="sync-note" id="videos-sync-note" aria-live="polite">Connecting to MythTV…</div>
+      </section>
+      <section class="toolbar" aria-label="Video library controls">
+        <label class="search-box">
+          <span aria-hidden="true">⌕</span>
+          <input id="video-search" type="search" placeholder="Search videos" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+        <div class="filter-group" role="group" aria-label="Filter by watched status">
+          <button class="filter-button selected" type="button" data-video-filter="all" aria-pressed="true">All</button>
+          <button class="filter-button" type="button" data-video-filter="unwatched" aria-pressed="false">Unwatched</button>
+          <button class="filter-button" type="button" data-video-filter="watched" aria-pressed="false">Watched</button>
+        </div>
+        <div class="filter-group" role="group" aria-label="Video view mode">
+          <button class="filter-button selected" type="button" data-video-mode="all" aria-pressed="true">All videos</button>
+          <button class="filter-button" type="button" data-video-mode="folders" aria-pressed="false">Folders</button>
+        </div>
+      </section>
+      <nav class="video-breadcrumb" id="video-breadcrumb" aria-label="Video folders" hidden></nav>
+      <p class="result-note" id="videos-result-note" aria-live="polite"></p>
+      <div class="program-grid" id="video-grid" aria-live="polite" aria-busy="true"></div>
+      <div class="empty-state" id="videos-empty-state" hidden>
+        <span class="empty-mark" aria-hidden="true">—</span>
+        <h2 id="videos-empty-title">No videos found</h2>
+        <p id="videos-empty-description">Try another search or change the watched filter.</p>
       </div>
     </main>
 
@@ -243,16 +279,31 @@
                 <option value="1.9">1.9×</option>
                 <option value="2.0">2.0×</option>
               </select>
+              <div class="player-volume-control">
+                <button class="player-button player-icon-button" id="player-mute" type="button" aria-label="Mute" title="Mute">
+                  <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" /><path d="M15.5 8.5a5 5 0 0 1 0 7m3-10a9 9 0 0 1 0 13" /></svg>
+                </button>
+                <input id="player-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+              </div>
               <label class="player-select-label" for="subtitle-track">Subtitles</label>
               <select class="player-select" id="subtitle-track" aria-label="Subtitle track">
                 <option value="">Off</option>
               </select>
               <label class="smart-skip-control"><input id="smart-skip" type="checkbox" checked> Auto-skip commercials</label>
+              <button class="player-button player-icon-button" id="player-theater" type="button" aria-label="Enter theater mode" title="Enter theater mode">
+                <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v12H3z" /><path d="M8 10h8M8 14h8" /></svg>
+              </button>
+              <button class="player-button player-icon-button" id="player-exit-theater" type="button" aria-label="Exit theater mode" title="Exit theater mode" hidden>
+                <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v12H3z" /><path d="m8 10-3 2 3 2m8-4 3 2-3 2" /></svg>
+              </button>
               <button class="player-button player-icon-button" id="player-fullscreen" type="button" aria-label="Enter fullscreen" title="Enter fullscreen">
                 <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg>
               </button>
               <button class="player-button player-icon-button" id="player-exit-fullscreen" type="button" aria-label="Exit fullscreen" title="Exit fullscreen" hidden>
                 <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg>
+              </button>
+              <button class="player-button player-icon-button" id="player-detach" type="button" aria-label="Detach player with Picture-in-Picture" title="Detach player with Picture-in-Picture">
+                <svg class="player-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z" /><path d="M13 12h6v5h-6z" /></svg>
               </button>
             </div>
             <details class="player-details" id="player-details">

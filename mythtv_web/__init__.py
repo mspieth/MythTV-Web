@@ -2,12 +2,13 @@ import fcntl
 import json
 import math
 import os
+import queue
 import re
 import shutil
-import signal
 import subprocess
-import time
+import threading
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -17,6 +18,7 @@ import requests
 from flask import (
     Flask,
     Response,
+    g,
     jsonify,
     render_template,
     request,
@@ -25,12 +27,17 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .auth import deletion_allowed, init_auth
+from .backend import cuttings, json_object, program_list
+from .recordings import RecordingsCache
+from .subtitles import SubtitleCache
+from .transcodes import CapacityError, TokenActiveError, TranscodeRegistry
 
 DEFAULT_BACKEND_URL = "http://127.0.0.1:6544"
 PRIMARY_RECORDING_GROUP = "Seasons"
 ACTIVE_RECORDING_GROUPS = {"Default", PRIMARY_RECORDING_GROUP}
-RECORDINGS_PAGE_SIZE = 5000
-RECORDINGS_CACHE_SECONDS = 120
+TRANSCODE_READ_RATE = 2
+TRANSCODE_OUTPUT_CHUNK_BYTES = 64 * 1024
+TRANSCODE_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
 RECORDING_RULE_FIELDS = (
     "Title",
     "SubTitle",
@@ -144,20 +151,247 @@ def _active_recording(app: Flask, recorded_id: int) -> dict | None:
 
 
 def _invalidate_recordings_cache(app: Flask) -> None:
-    cache_path = Path(app.config["MYTHTV_RECORDINGS_CACHE_PATH"])
-    lock_path = cache_path.with_suffix(f"{cache_path.suffix}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            cache_path.unlink(missing_ok=True)
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    app.extensions["recordings_cache"].invalidate(app)
 
 
 def _recording_url(app: Flask, recorded_id: int) -> str:
     return f"{app.config['MYTHTV_BACKEND_URL']}/Content/GetRecording?RecordedId={recorded_id}"
+
+
+def _video_url(app: Flask, video_id: int) -> str:
+    return f"{app.config['MYTHTV_BACKEND_URL']}/Content/GetVideo?Id={video_id}"
+
+
+def _subtitle_start_time():
+    try:
+        start = float(request.args.get("start", "0"))
+    except ValueError:
+        return None
+    return start if math.isfinite(start) and start >= 0 else None
+
+
+def _transcode_start_argument() -> str | None:
+    raw_start = request.args.get("start", "0")
+    if len(raw_start) > 32 or re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw_start) is None:
+        return None
+    try:
+        start = Decimal(raw_start)
+    except InvalidOperation:
+        return None
+    if not start.is_finite() or start > Decimal(7 * 24 * 60 * 60):
+        return None
+    return format(start.normalize(), "f")
+
+
+@lru_cache(maxsize=128)
+def _probe_video(app: Flask, video_id: int) -> dict:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {"frame_rate": None, "duration": None, "subtitles": []}
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=index,codec_type,avg_frame_rate,r_frame_rate:stream_tags=language,title:format=duration",
+                "-of",
+                "json",
+                _video_url(app, video_id),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        app.logger.info("Video stream probe failed for %s: %s", video_id, error)
+        return {"frame_rate": None, "duration": None, "subtitles": []}
+
+    frame_rate = None
+    subtitles = []
+    for stream in payload.get("streams", []):
+        if stream.get("codec_type") == "video" and frame_rate is None:
+            for value in (stream.get("avg_frame_rate"), stream.get("r_frame_rate")):
+                try:
+                    candidate = float(Fraction(value))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+                if math.isfinite(candidate) and candidate > 0:
+                    frame_rate = candidate
+                    break
+        elif stream.get("codec_type") == "subtitle":
+            tags = stream.get("tags") or {}
+            subtitles.append(
+                {
+                    "index": stream.get("index"),
+                    "language": tags.get("language", "und"),
+                    "title": tags.get("title", ""),
+                }
+            )
+    try:
+        duration = float(payload.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    if duration is not None and (not math.isfinite(duration) or duration <= 0):
+        duration = None
+    return {"frame_rate": frame_rate, "duration": duration, "subtitles": subtitles}
+
+
+def _start_transcode(
+    app: Flask,
+    ffmpeg: str,
+    source_url: str,
+    start: str,
+    token: str,
+    resource_id: int,
+    subtitle_index: int | None = None,
+):
+    threads = str(app.config["MYTHTV_FFMPEG_THREADS"])
+    video_options = ["-map", "0:v:0?"]
+    if subtitle_index is not None:
+        video_options = [
+            "-filter_complex_threads",
+            threads,
+            "-filter_complex",
+            f"[0:v:0][0:{subtitle_index}]overlay=eof_action=pass[v]",
+            "-map",
+            "[v]",
+        ]
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        threads,
+        "-filter_threads",
+        threads,
+        "-ss",
+        start,
+        "-readrate",
+        str(TRANSCODE_READ_RATE),
+        "-readrate_initial_burst",
+        "2",
+        "-i",
+        source_url,
+        *video_options,
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-threads:v",
+        threads,
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-threads:a",
+        threads,
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
+    registry = TranscodeRegistry(
+        app.config["MYTHTV_TRANSCODE_DIR"], app.config["MYTHTV_MAX_TRANSCODES"]
+    )
+    try:
+        job = registry.start(command, token, resource_id, g.current_user)
+    except TokenActiveError:
+        return jsonify(error="Transcode token is already active"), 409
+    except CapacityError:
+        return (
+            jsonify(error="All transcode slots are busy. Try again shortly."),
+            503,
+        )
+    except OSError as error:
+        app.logger.warning("Could not start FFmpeg: %s", error)
+        return jsonify(error="Could not start FFmpeg"), 502
+    output_queue = queue.Queue(
+        maxsize=TRANSCODE_OUTPUT_BUFFER_BYTES // TRANSCODE_OUTPUT_CHUNK_BYTES
+    )
+    stop_output = threading.Event()
+    finished = object()
+
+    def fill_output_buffer():
+        try:
+            while chunk := job.process.stdout.read1(TRANSCODE_OUTPUT_CHUNK_BYTES):
+                while not stop_output.is_set():
+                    try:
+                        output_queue.put(chunk, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop_output.is_set():
+                try:
+                    output_queue.put(finished, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def generate():
+        output_thread = threading.Thread(target=fill_output_buffer, daemon=True)
+        output_thread.start()
+        completed = False
+        try:
+            while True:
+                chunk = output_queue.get()
+                if chunk is finished:
+                    completed = True
+                    break
+                yield chunk
+        finally:
+            stop_output.set()
+            exit_code = None
+            if completed:
+                try:
+                    exit_code = job.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                job.close()
+            finally:
+                output_thread.join(timeout=3)
+            if completed and exit_code is None:
+                exit_code = job.process.returncode
+            if completed and exit_code:
+                app.logger.error(
+                    "FFmpeg transcode %s ended with exit code %s", token, exit_code
+                )
+
+    response = Response(
+        stream_with_context(generate()),
+        content_type="video/mp4",
+        headers={"Cache-Control": "no-store"},
+    )
+    response.call_on_close(job.close)
+    return response
+
+
+def _cancel_transcode(app: Flask, resource_id: int):
+    payload = request.get_json(silent=True)
+    token = payload.get("token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
+        return jsonify(error="A valid transcode token is required"), 400
+    registry = TranscodeRegistry(
+        app.config["MYTHTV_TRANSCODE_DIR"], app.config["MYTHTV_MAX_TRANSCODES"]
+    )
+    try:
+        cancelled = registry.cancel(token, resource_id, g.current_user)
+    except (OSError, AttributeError):
+        return jsonify(cancelled=False), 404
+    return jsonify(cancelled=cancelled), 200 if cancelled else 404
 
 
 @lru_cache(maxsize=128)
@@ -260,7 +494,7 @@ def _post_playback_offset(
         **request_options,
     )
     response.raise_for_status()
-    payload = response.json()
+    payload = json_object(response)
     if not isinstance(payload, dict) or payload.get("bool") is not False:
         return isinstance(payload, dict) and payload.get("bool") is True
 
@@ -273,7 +507,7 @@ def _post_playback_offset(
         **request_options,
     )
     response.raise_for_status()
-    payload = response.json()
+    payload = json_object(response)
     return isinstance(payload, dict) and payload.get("bool") is True
 
 
@@ -287,65 +521,19 @@ def _read_frame_offset(
         timeout=app.config["MYTHTV_TIMEOUT"],
     )
     response.raise_for_status()
-    frames = int(response.json().get("long", 0))
+    frames = int(json_object(response).get("long", 0))
     frame_rate = _probe_recording(app, recorded_id).get("video_frame_rate")
     return round(frames * 1000 / frame_rate) if frame_rate else 0
 
 
 def _load_all_recordings(app: Flask) -> list[dict]:
-    cache_path = Path(app.config["MYTHTV_RECORDINGS_CACHE_PATH"])
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_path.with_suffix(f"{cache_path.suffix}.lock")
-
-    with lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            try:
-                cached = json.loads(cache_path.read_text())
-                cache_age = time.time() - cached["cached_at"]
-                if cache_age <= RECORDINGS_CACHE_SECONDS:
-                    return cached["programs"]
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-
-            programs = []
-            start_index = 0
-            total = None
-            while total is None or start_index < total:
-                response = requests.get(
-                    f"{app.config['MYTHTV_BACKEND_URL']}/Dvr/GetRecordedList",
-                    params={
-                        "StartIndex": start_index,
-                        "Count": RECORDINGS_PAGE_SIZE,
-                        "Descending": "true",
-                    },
-                    headers={"Accept": "application/json"},
-                    timeout=app.config["MYTHTV_GROUPS_TIMEOUT"],
-                )
-                response.raise_for_status()
-                payload = response.json().get("ProgramList", {})
-                page = payload.get("Programs", [])
-                total = payload.get("TotalAvailable", 0)
-                programs.extend(page)
-                count = payload.get("Count", len(page))
-                if count <= 0:
-                    break
-                start_index += count
-
-            temporary_path = cache_path.with_name(
-                f".{cache_path.name}.{os.getpid()}.tmp"
-            )
-            temporary_path.write_text(
-                json.dumps({"cached_at": time.time(), "programs": programs})
-            )
-            os.replace(temporary_path, cache_path)
-            return programs
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    return app.extensions["recordings_cache"].load(app)
 
 
 def create_app(config: dict | None = None) -> Flask:
     app = Flask(__name__)
+    app.extensions["recordings_cache"] = RecordingsCache()
+    app.extensions["subtitle_cache"] = SubtitleCache()
     app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
 
     @app.after_request
@@ -362,8 +550,21 @@ def create_app(config: dict | None = None) -> Flask:
     app.config["MYTHTV_RECORDINGS_CACHE_PATH"] = str(
         Path(__file__).resolve().parents[1] / ".run" / "recordings-cache.json"
     )
+    app.config["MYTHTV_VIDEO_THUMBNAIL_DIR"] = str(
+        Path(__file__).resolve().parents[1] / ".run" / "video-thumbnails"
+    )
     app.config["MYTHTV_TRANSCODE_DIR"] = str(
         Path(__file__).resolve().parents[1] / ".run" / "transcodes"
+    )
+    app.config["MYTHTV_SUBTITLE_CACHE_DIR"] = os.environ.get(
+        "MYTHTV_SUBTITLE_CACHE_DIR",
+        str(Path(__file__).resolve().parents[1] / ".run" / "subtitles"),
+    )
+    app.config["MYTHTV_MAX_TRANSCODES"] = int(
+        os.environ.get("MYTHTV_MAX_TRANSCODES", "2")
+    )
+    app.config["MYTHTV_FFMPEG_THREADS"] = int(
+        os.environ.get("MYTHTV_FFMPEG_THREADS", "2")
     )
     app.config.update(
         AUTH_DATABASE_PATH=os.environ.get(
@@ -375,6 +576,7 @@ def create_app(config: dict | None = None) -> Flask:
             "MYTHTV_INITIAL_ADMIN_PASSWORD", "mythtv-admin"
         ),
         SECRET_KEY=os.environ.get("MYTHTV_SECRET_KEY"),
+        SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=os.environ.get("MYTHTV_SESSION_COOKIE_SECURE", "0")
         in {"1", "true", "yes"},
     )
@@ -384,6 +586,9 @@ def create_app(config: dict | None = None) -> Flask:
     app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=session_lifetime_days)
     if config:
         app.config.update(config)
+    for key in ("MYTHTV_MAX_TRANSCODES", "MYTHTV_FFMPEG_THREADS"):
+        if type(app.config[key]) is not int or app.config[key] < 1:
+            raise ValueError(f"{key} must be a positive integer")
     init_auth(app)
 
     @app.get("/")
@@ -393,6 +598,121 @@ def create_app(config: dict | None = None) -> Flask:
     @app.get("/healthz")
     def healthz():
         return jsonify(status="ok")
+
+    @app.get("/api/videos")
+    def videos():
+        try:
+            response = requests.get(
+                f"{app.config['MYTHTV_BACKEND_URL']}/Video/GetVideoList",
+                params={
+                    "Sort": "title",
+                    "StartIndex": 0,
+                    "Count": 0,
+                    "CollapseSubDirs": "false",
+                },
+                headers={"Accept": "application/json"},
+                timeout=app.config["MYTHTV_GROUPS_TIMEOUT"],
+            )
+            response.raise_for_status()
+            root = response.json()
+        except (requests.RequestException, ValueError) as error:
+            app.logger.warning("MythTV video-list request failed: %s", error)
+            return jsonify(error="Could not load MythTV videos"), 502
+
+        payload = root.get("VideoMetadataInfoList") if isinstance(root, dict) else None
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("VideoMetadataInfos"), list
+        ):
+            return jsonify(error="MythTV returned an invalid video list"), 502
+
+        return jsonify(
+            videos=payload["VideoMetadataInfos"],
+            total=payload.get("TotalAvailable", len(payload["VideoMetadataInfos"])),
+            as_of=payload.get("AsOf"),
+        )
+
+    @app.get("/api/video-preview/<int:video_id>")
+    def video_preview(video_id):
+        if video_id <= 0:
+            return jsonify(error="A valid video ID is required"), 400
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return Response(status=404)
+
+        thumbnail_dir = Path(app.config["MYTHTV_VIDEO_THUMBNAIL_DIR"])
+        thumbnail_dir.mkdir(parents=True, exist_ok=True)
+        thumbnail_path = thumbnail_dir / f"{video_id}.jpg"
+        lock_path = thumbnail_dir / f"{video_id}.jpg.lock"
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if not thumbnail_path.is_file():
+                    stream_url = (
+                        f"{app.config['MYTHTV_BACKEND_URL']}"
+                        f"/Content/GetVideo?Id={video_id}"
+                    )
+
+                    def extract_frame(position):
+                        return subprocess.run(
+                            [
+                                ffmpeg,
+                                "-nostdin",
+                                "-v",
+                                "error",
+                                "-ss",
+                                str(position),
+                                "-i",
+                                stream_url,
+                                "-frames:v",
+                                "1",
+                                "-vf",
+                                "scale=640:-2",
+                                "-f",
+                                "image2pipe",
+                                "-vcodec",
+                                "mjpeg",
+                                "pipe:1",
+                            ],
+                            capture_output=True,
+                            timeout=30,
+                            check=True,
+                        )
+
+                    try:
+                        result = extract_frame(15)
+                    except (OSError, subprocess.SubprocessError) as error:
+                        app.logger.info(
+                            "Video thumbnail seek failed for %s: %s", video_id, error
+                        )
+                        result = None
+
+                    if result is None or not result.stdout:
+                        try:
+                            result = extract_frame(0)
+                        except (OSError, subprocess.SubprocessError) as error:
+                            app.logger.info(
+                                "Video thumbnail extraction failed for %s: %s",
+                                video_id,
+                                error,
+                            )
+                            return Response(status=404)
+                    if not result.stdout:
+                        return Response(status=404)
+
+                    temporary_path = thumbnail_path.with_name(
+                        f".{thumbnail_path.name}.{os.getpid()}.tmp"
+                    )
+                    temporary_path.write_bytes(result.stdout)
+                    os.replace(temporary_path, thumbnail_path)
+
+                return Response(
+                    thumbnail_path.read_bytes(),
+                    content_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     @app.get("/api/programs")
     def programs():
@@ -410,8 +730,8 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             response.raise_for_status()
-            payload = response.json().get("ProgramList", {})
-        except (requests.RequestException, ValueError) as error:
+            payload = program_list(response)
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV recorded-list request failed: %s", error)
             return jsonify(error="MythTV backend is unavailable"), 502
 
@@ -432,8 +752,8 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             response.raise_for_status()
-            payload = response.json().get("BackendStatus")
-        except (requests.RequestException, ValueError) as error:
+            payload = json_object(response, "BackendStatus")
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV backend-status request failed: %s", error)
             return jsonify(error="Could not load MythTV backend status"), 502
 
@@ -453,8 +773,8 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             response.raise_for_status()
-            payload = response.json().get("ProgramList", {})
-        except (requests.RequestException, ValueError) as error:
+            payload = program_list(response)
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV upcoming-list request failed: %s", error)
             return jsonify(error="Could not load upcoming recordings"), 502
 
@@ -490,8 +810,8 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             response.raise_for_status()
-            payload = response.json().get("ProgramGuide")
-        except (requests.RequestException, ValueError) as error:
+            payload = json_object(response, "ProgramGuide")
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV program-guide request failed: %s", error)
             return jsonify(error="Could not load the MythTV program guide"), 502
 
@@ -537,7 +857,7 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=timeout,
             )
             rule_response.raise_for_status()
-            rule = rule_response.json().get("RecRule")
+            rule = json_object(rule_response, "RecRule")
             if not isinstance(rule, dict):
                 return jsonify(error="MythTV returned an invalid recording rule"), 502
 
@@ -558,7 +878,7 @@ def create_app(config: dict | None = None) -> Flask:
                     timeout=timeout,
                 )
                 response.raise_for_status()
-                choices[key] = response.json()
+                choices[key] = json_object(response)
         except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV schedule-options request failed: %s", error)
             return jsonify(error="Could not load recording options"), 502
@@ -604,7 +924,7 @@ def create_app(config: dict | None = None) -> Flask:
                 **request_options,
             )
             lookup.raise_for_status()
-            rule = lookup.json().get("RecRule")
+            rule = json_object(lookup, "RecRule")
             if not isinstance(rule, dict):
                 return jsonify(error="MythTV returned an invalid recording rule"), 502
             if int(rule.get("Id") or 0) > 0:
@@ -633,7 +953,7 @@ def create_app(config: dict | None = None) -> Flask:
                 **request_options,
             )
             created.raise_for_status()
-            result = created.json()
+            result = json_object(created)
             rule_id = result.get("uint") if isinstance(result, dict) else None
         except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV schedule request failed: %s", error)
@@ -661,7 +981,7 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=timeout,
             )
             lookup.raise_for_status()
-            rule = lookup.json().get("RecRule")
+            rule = json_object(lookup, "RecRule")
             if not isinstance(rule, dict) or int(rule.get("Id") or 0) != record_id:
                 return jsonify(error="Recording rule not found"), 404
             rule.update(
@@ -679,13 +999,14 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=timeout,
             )
             updated.raise_for_status()
+            result = json_object(updated)
+            if result.get("bool") is not True:
+                return jsonify(error="MythTV did not update the recording rule"), 502
         except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV schedule update failed: %s", error)
             return jsonify(error="Could not update the MythTV recording rule"), 502
 
-        return jsonify(
-            updated=bool(updated.json().get("bool", True)), rule_id=record_id
-        )
+        return jsonify(updated=True, rule_id=record_id)
 
     @app.post("/api/schedules/<int:record_id>/delete")
     @deletion_allowed
@@ -702,7 +1023,7 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             response.raise_for_status()
-            result = response.json()
+            result = json_object(response)
         except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV schedule removal failed: %s", error)
             return jsonify(error="Could not remove the MythTV recording rule"), 502
@@ -832,9 +1153,9 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             upstream.raise_for_status()
-            payload = upstream.json()
+            payload = json_object(upstream)
             deleted = isinstance(payload, dict) and payload.get("bool") is True
-        except (requests.RequestException, ValueError) as error:
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV recording deletion failed: %s", error)
             return jsonify(error="Could not delete recording from MythTV"), 502
 
@@ -880,6 +1201,10 @@ def create_app(config: dict | None = None) -> Flask:
         if parsed_url.path == "/Content/GetRecordingArtwork":
             parameters.pop("Width", None)
             parameters.pop("Height", None)
+        elif parameters["FileName"].startswith("/"):
+            parameters["FileName"] = Path(parameters["FileName"]).name
+            if not parameters["FileName"]:
+                return jsonify(error="Invalid artwork URL"), 400
 
         try:
             upstream = requests.get(
@@ -994,8 +1319,10 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             bookmark.raise_for_status()
-            last_position_ms = int(last_position.json().get("long", 0))
-            bookmark_ms = int(bookmark.json().get("long", 0))
+            commercial_markers = cuttings(comm_breaks)
+            edit_markers = cuttings(cut_list)
+            last_position_ms = int(json_object(last_position).get("long", 0))
+            bookmark_ms = int(json_object(bookmark).get("long", 0))
             if last_position_ms < 0:
                 last_position_ms = _read_frame_offset(
                     app, "GetLastPlayPos", recorded_id, params
@@ -1004,17 +1331,15 @@ def create_app(config: dict | None = None) -> Flask:
                 bookmark_ms = _read_frame_offset(
                     app, "GetSavedBookmark", recorded_id, params
                 )
-        except (requests.RequestException, ValueError) as error:
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV playback metadata request failed: %s", error)
             return jsonify(error="Could not load MythTV playback metadata"), 502
 
         return jsonify(
             program=program,
             media=_probe_recording(app, recorded_id),
-            comm_breaks=_commercial_breaks_from_cuttings(
-                (comm_breaks.json().get("CutList") or {}).get("Cuttings", [])
-            ),
-            cut_list=(cut_list.json().get("CutList") or {}).get("Cuttings", []),
+            comm_breaks=_commercial_breaks_from_cuttings(commercial_markers),
+            cut_list=edit_markers,
             last_position=last_position_ms,
             bookmark=bookmark_ms,
         )
@@ -1037,7 +1362,7 @@ def create_app(config: dict | None = None) -> Flask:
                 timeout=app.config["MYTHTV_TIMEOUT"],
             )
             current.raise_for_status()
-            payload = current.json()
+            payload = json_object(current)
             program = payload.get("Program") if isinstance(payload, dict) else None
             if not isinstance(program, dict):
                 return jsonify(error="Invalid MythTV recording status response"), 502
@@ -1059,9 +1384,7 @@ def create_app(config: dict | None = None) -> Flask:
                     timeout=app.config["MYTHTV_TIMEOUT"],
                 )
                 markers.raise_for_status()
-                comm_breaks = _commercial_breaks_from_cuttings(
-                    (markers.json().get("CutList") or {}).get("Cuttings", [])
-                )
+                comm_breaks = _commercial_breaks_from_cuttings(cuttings(markers))
         except (requests.RequestException, ValueError, AttributeError) as error:
             app.logger.info("MythTV live playback status refresh failed: %s", error)
             return jsonify(error="Could not refresh MythTV recording status"), 502
@@ -1121,6 +1444,206 @@ def create_app(config: dict | None = None) -> Flask:
                 response.headers[header] = upstream.headers[header]
         return response
 
+    @app.get("/api/videos/<int:video_id>/stream")
+    def video_stream(video_id):
+        if video_id <= 0:
+            return jsonify(error="A valid video ID is required"), 400
+
+        headers = {}
+        if request.headers.get("Range"):
+            headers["Range"] = request.headers["Range"]
+        try:
+            upstream = requests.get(
+                f"{app.config['MYTHTV_BACKEND_URL']}/Content/GetVideo",
+                params={"Id": video_id},
+                headers=headers,
+                stream=True,
+                timeout=app.config["MYTHTV_TIMEOUT"],
+            )
+            upstream.raise_for_status()
+        except requests.RequestException as error:
+            app.logger.info("MythTV video stream failed: %s", error)
+            return Response(status=404)
+
+        def generate():
+            try:
+                yield from upstream.iter_content(chunk_size=64 * 1024)
+            finally:
+                upstream.close()
+
+        response = Response(
+            stream_with_context(generate()),
+            status=upstream.status_code,
+            content_type=upstream.headers.get(
+                "Content-Type", "application/octet-stream"
+            ),
+        )
+        for header in (
+            "Accept-Ranges",
+            "Content-Length",
+            "Content-Range",
+            "Content-Disposition",
+            "Last-Modified",
+        ):
+            if header in upstream.headers:
+                response.headers[header] = upstream.headers[header]
+        return response
+
+    @app.get("/api/videos/<int:video_id>/playback")
+    def video_playback_info(video_id):
+        if video_id <= 0:
+            return jsonify(error="A valid video ID is required"), 400
+        try:
+            bookmark_response = requests.get(
+                f"{app.config['MYTHTV_BACKEND_URL']}/Video/GetSavedBookmark",
+                params={"Id": video_id},
+                headers={"Accept": "application/json"},
+                timeout=app.config["MYTHTV_TIMEOUT"],
+            )
+            bookmark_response.raise_for_status()
+            position_response = requests.get(
+                f"{app.config['MYTHTV_BACKEND_URL']}/Video/GetLastPlayPos",
+                params={"Id": video_id},
+                headers={"Accept": "application/json"},
+                timeout=app.config["MYTHTV_TIMEOUT"],
+            )
+            position_response.raise_for_status()
+            bookmark_frames = int(bookmark_response.json().get("long", 0))
+            position_frames = int(position_response.json().get("long", 0))
+        except (requests.RequestException, ValueError, AttributeError) as error:
+            app.logger.info("MythTV video playback lookup failed: %s", error)
+            return jsonify(error="Could not load video playback details"), 502
+
+        media = _probe_video(app, video_id)
+        frame_rate = media["frame_rate"]
+        return jsonify(
+            duration=media["duration"],
+            frame_rate=frame_rate,
+            last_position=position_frames / frame_rate if frame_rate else 0,
+            bookmark=bookmark_frames / frame_rate if frame_rate else 0,
+            subtitles=media["subtitles"],
+        )
+
+    def save_video_position(video_id, endpoint):
+        if video_id <= 0:
+            return jsonify(error="A valid video ID is required"), 400
+        position = request.json.get("position") if request.is_json else None
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, (int, float))
+            or not math.isfinite(position)
+            or position < 0
+        ):
+            return jsonify(error="A non-negative playback position is required"), 400
+        frame_rate = _probe_video(app, video_id)["frame_rate"]
+        if not frame_rate:
+            return jsonify(error="Video frame rate is unavailable"), 502
+        try:
+            response = requests.post(
+                f"{app.config['MYTHTV_BACKEND_URL']}/Video/{endpoint}",
+                params={"Id": video_id, "Offset": round(position * frame_rate)},
+                headers={"Accept": "application/json"},
+                timeout=app.config["MYTHTV_TIMEOUT"],
+            )
+            response.raise_for_status()
+            result = response.json()
+        except (requests.RequestException, ValueError) as error:
+            app.logger.warning("MythTV video position save failed: %s", error)
+            return jsonify(error="Could not save video playback position"), 502
+        if not isinstance(result, dict) or result.get("bool") is not True:
+            return jsonify(error="MythTV did not save the video position"), 502
+        return jsonify(saved=True)
+
+    @app.post("/api/videos/<int:video_id>/position")
+    def save_video_playback_position(video_id):
+        return save_video_position(video_id, "SetLastPlayPos")
+
+    @app.post("/api/videos/<int:video_id>/bookmark")
+    def save_video_playback_bookmark(video_id):
+        return save_video_position(video_id, "SetSavedBookmark")
+
+    @app.get("/api/videos/<int:video_id>/subtitles/<int:stream_index>")
+    def video_subtitles(video_id, stream_index):
+        if video_id <= 0 or stream_index < 0:
+            return jsonify(error="A valid video and subtitle track are required"), 400
+        start = _subtitle_start_time()
+        if start is None:
+            return jsonify(error="A valid subtitle start time is required"), 400
+        subtitle_track = next(
+            (
+                track
+                for track in _probe_video(app, video_id)["subtitles"]
+                if track["index"] == stream_index
+            ),
+            None,
+        )
+        if subtitle_track is None:
+            return jsonify(error="Subtitle track not found"), 404
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return jsonify(error="FFmpeg is required to extract subtitles"), 501
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+        if start > 0:
+            command.extend(["-ss", str(start)])
+        if subtitle_track["codec"] == "dvb_teletext":
+            command.extend(["-fix_sub_duration", "-txt_format", "text"])
+        command.extend(
+            [
+                "-i",
+                _video_url(app, video_id),
+                "-map",
+                f"0:{stream_index}",
+                "-f",
+                "webvtt",
+                "pipe:1",
+            ]
+        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            app.logger.warning("Video subtitle extraction failed: %s", error)
+            return jsonify(error="Could not extract video subtitles"), 502
+        if result.returncode:
+            return Response(status=404)
+        return Response(result.stdout, content_type="text/vtt; charset=utf-8")
+
+    @app.post("/api/videos/<int:video_id>/watched")
+    def update_video_watched(video_id):
+        payload = request.get_json(silent=True)
+        watched = payload.get("watched") if isinstance(payload, dict) else None
+        if video_id <= 0 or not isinstance(watched, bool):
+            return (
+                jsonify(error="A valid video ID and watched status are required"),
+                400,
+            )
+
+        try:
+            upstream = requests.post(
+                f"{app.config['MYTHTV_BACKEND_URL']}/Video/UpdateVideoWatchedStatus",
+                json={"Id": video_id, "Watched": watched},
+                headers={"Accept": "application/json"},
+                timeout=app.config["MYTHTV_TIMEOUT"],
+            )
+            upstream.raise_for_status()
+            result = upstream.json()
+        except (requests.RequestException, ValueError) as error:
+            app.logger.warning("MythTV video watched-status update failed: %s", error)
+            return jsonify(error="Could not update video watched status"), 502
+
+        if not isinstance(result, dict) or not isinstance(result.get("bool"), bool):
+            return (
+                jsonify(error="MythTV returned an invalid watched-status response"),
+                502,
+            )
+        if not result["bool"]:
+            return jsonify(error="Video not found"), 404
+        return jsonify(watched=watched)
+
     @app.post("/api/playback/<int:recorded_id>/position")
     def save_playback_position(recorded_id):
         try:
@@ -1131,12 +1654,14 @@ def create_app(config: dict | None = None) -> Flask:
         if program is None:
             return jsonify(error="Recording not found"), 404
 
-        position = request.json.get("position") if request.is_json else None
+        payload = request.get_json(silent=True)
+        position = payload.get("position") if isinstance(payload, dict) else None
         if (
             isinstance(position, bool)
             or not isinstance(position, (int, float))
-            or not math.isfinite(position)
             or position < 0
+            or position > 7 * 24 * 60 * 60
+            or not math.isfinite(position)
         ):
             return jsonify(error="A non-negative playback position is required"), 400
         try:
@@ -1154,7 +1679,7 @@ def create_app(config: dict | None = None) -> Flask:
             if not saved:
                 app.logger.warning("MythTV rejected playback position save")
                 return jsonify(error="MythTV did not save playback position"), 502
-        except (requests.RequestException, ValueError) as error:
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV playback position save failed: %s", error)
             return jsonify(error="Could not save playback position"), 502
         return jsonify(saved=True)
@@ -1169,12 +1694,14 @@ def create_app(config: dict | None = None) -> Flask:
         if program is None:
             return jsonify(error="Recording not found"), 404
 
-        position = request.json.get("position") if request.is_json else None
+        payload = request.get_json(silent=True)
+        position = payload.get("position") if isinstance(payload, dict) else None
         if (
             isinstance(position, bool)
             or not isinstance(position, (int, float))
-            or not math.isfinite(position)
             or position < 0
+            or position > 7 * 24 * 60 * 60
+            or not math.isfinite(position)
         ):
             return jsonify(error="A non-negative playback position is required"), 400
         try:
@@ -1192,7 +1719,7 @@ def create_app(config: dict | None = None) -> Flask:
             if not saved:
                 app.logger.warning("MythTV rejected playback bookmark save")
                 return jsonify(error="MythTV did not save playback bookmark"), 502
-        except (requests.RequestException, ValueError) as error:
+        except (requests.RequestException, ValueError, TypeError) as error:
             app.logger.warning("MythTV bookmark save failed: %s", error)
             return jsonify(error="Could not save playback bookmark"), 502
         return jsonify(saved=True)
@@ -1210,23 +1737,12 @@ def create_app(config: dict | None = None) -> Flask:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return jsonify(error="FFmpeg is required to transcode this recording"), 501
-        start = request.args.get("start", default=0.0, type=float)
+        start = _transcode_start_argument()
         token = request.args.get("token", "")
-        if (
-            start is None
-            or not math.isfinite(start)
-            or start < 0
-            or start > 7 * 24 * 60 * 60
-        ):
+        if start is None:
             return jsonify(error="Invalid playback start position"), 400
         if not re.fullmatch(r"[a-f0-9]{32}", token):
             return jsonify(error="A valid transcode token is required"), 400
-        transcode_dir = Path(app.config["MYTHTV_TRANSCODE_DIR"])
-        transcode_dir.mkdir(parents=True, exist_ok=True)
-        process_path = transcode_dir / f"{token}.pid"
-        if process_path.exists():
-            return jsonify(error="Transcode token is already active"), 409
-
         subtitle = request.args.get("subtitle")
         subtitle_index = None
         if subtitle is not None:
@@ -1240,92 +1756,56 @@ def create_app(config: dict | None = None) -> Flask:
                 for track in tracks
             ):
                 return jsonify(error="DVB subtitle track not found"), 404
-        threads = "2"
-        video_options = ["-map", "0:v:0?"]
-        if subtitle_index is not None:
-            video_options = [
-                "-filter_complex_threads",
-                threads,
-                "-filter_complex",
-                f"[0:v:0][0:{subtitle_index}]overlay=eof_action=pass[v]",
-                "-map",
-                "[v]",
-            ]
-        command = [
+        return _start_transcode(
+            app,
             ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            str(start),
-            "-i",
             _recording_url(app, recorded_id),
-            *video_options,
-            "-map",
-            "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-movflags",
-            "+frag_keyframe+empty_moov+default_base_moof",
-            "-f",
-            "mp4",
-            "pipe:1",
-        ]
-        try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as error:
-            app.logger.warning("Could not start FFmpeg: %s", error)
-            return jsonify(error="Could not start FFmpeg"), 502
-        process_path.write_text(str(process.pid))
-
-        def generate():
-            try:
-                while chunk := process.stdout.read1(64 * 1024):
-                    yield chunk
-            finally:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                process_path.unlink(missing_ok=True)
-
-        return Response(
-            stream_with_context(generate()),
-            content_type="video/mp4",
-            headers={"Cache-Control": "no-store"},
+            start,
+            token,
+            recorded_id,
+            subtitle_index=subtitle_index,
         )
 
     @app.post("/api/playback/<int:recorded_id>/transcode/cancel")
     def cancel_playback_transcode(recorded_id):
-        payload = request.get_json(silent=True) or {}
-        token = payload.get("token", "")
+        payload = request.get_json(silent=True)
+        token = payload.get("token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
+            return jsonify(error="A valid transcode token is required"), 400
+        registry = TranscodeRegistry(
+            app.config["MYTHTV_TRANSCODE_DIR"], app.config["MYTHTV_MAX_TRANSCODES"]
+        )
+        try:
+            cancelled = registry.cancel(token, recorded_id, g.current_user)
+        except (OSError, AttributeError):
+            return jsonify(cancelled=False), 404
+        return jsonify(cancelled=cancelled), 200 if cancelled else 404
+
+    @app.get("/api/videos/<int:video_id>/transcode")
+    def video_transcode(video_id):
+        if video_id <= 0:
+            return jsonify(error="A valid video ID is required"), 400
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return jsonify(error="FFmpeg is required to transcode this video"), 501
+        start = _transcode_start_argument()
+        token = request.args.get("token", "")
+        if start is None:
+            return jsonify(error="Invalid playback start position"), 400
         if not re.fullmatch(r"[a-f0-9]{32}", token):
             return jsonify(error="A valid transcode token is required"), 400
-        process_path = Path(app.config["MYTHTV_TRANSCODE_DIR"]) / f"{token}.pid"
-        try:
-            process_id = int(process_path.read_text())
-            os.kill(process_id, signal.SIGTERM)
-        except FileNotFoundError:
-            return jsonify(cancelled=False), 404
-        except (OSError, ValueError):
-            return jsonify(cancelled=False), 404
-        return jsonify(cancelled=True)
+
+        source_url = (
+            f"{app.config['MYTHTV_BACKEND_URL']}/Content/GetVideo?Id={video_id}"
+        )
+        return _start_transcode(app, ffmpeg, source_url, start, token, video_id)
+
+    @app.post("/api/videos/<int:video_id>/transcode/cancel")
+    def cancel_video_transcode(video_id):
+        if video_id <= 0:
+            return jsonify(error="A valid video ID is required"), 400
+        return _cancel_transcode(app, video_id)
 
     @app.get("/api/playback/<int:recorded_id>/subtitles/<int:stream_index>")
     def playback_subtitles(recorded_id, stream_index):
@@ -1336,41 +1816,41 @@ def create_app(config: dict | None = None) -> Flask:
             return jsonify(error="MythTV backend is unavailable"), 502
         if program is None:
             return jsonify(error="Recording not found"), 404
+        start = _subtitle_start_time()
+        if start is None:
+            return jsonify(error="A valid subtitle start time is required"), 400
 
-        subtitle_indexes = {
-            track["index"] for track in _probe_recording(app, recorded_id)["subtitles"]
-        }
-        if stream_index not in subtitle_indexes:
+        subtitle_track = next(
+            (
+                track
+                for track in _probe_recording(app, recorded_id)["subtitles"]
+                if track["index"] == stream_index
+            ),
+            None,
+        )
+        if subtitle_track is None:
             return jsonify(error="Subtitle track not found"), 404
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return jsonify(error="FFmpeg is required to extract subtitles"), 501
         try:
-            result = subprocess.run(
-                [
-                    ffmpeg,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    _recording_url(app, recorded_id),
-                    "-map",
-                    f"0:{stream_index}",
-                    "-f",
-                    "webvtt",
-                    "pipe:1",
-                ],
-                capture_output=True,
-                timeout=120,
-                check=False,
+            contents = app.extensions["subtitle_cache"].get(
+                app,
+                program,
+                recorded_id,
+                stream_index,
+                ffmpeg,
+                _recording_url(app, recorded_id),
+                start=start,
+                codec=subtitle_track["codec"],
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             app.logger.warning("Subtitle extraction failed: %s", error)
             return jsonify(error="Could not extract recording subtitles"), 502
-        if result.returncode:
-            app.logger.info("Subtitle extraction returned %s", result.returncode)
+        if contents is None:
+            app.logger.info("Subtitle extraction failed")
             return Response(status=404)
-        return Response(result.stdout, content_type="text/vtt; charset=utf-8")
+        return Response(contents, content_type="text/vtt; charset=utf-8")
 
     return app

@@ -14,24 +14,42 @@ function deferred() {
 
 function harness() {
   class Element extends EventTarget {
-    constructor() {
+    constructor(tagName = "div") {
       super();
+      this.tagName = tagName;
       this.dataset = {};
       this.content = "";
       this.value = "";
       this.textContent = "";
       this.currentTime = 0;
       this.duration = 1000;
+      this.track = { mode: "disabled" };
       this.playCalls = 0;
       this.open = false;
-      this.classList = { add() {}, remove() {}, toggle() {} };
+      this.attributes = new Map();
+      this.children = [];
+      const classes = new Set();
+      this.classList = {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        contains: (name) => classes.has(name),
+        toggle: (name, force) => {
+          const enabled = force ?? !classes.has(name);
+          if (enabled) classes.add(name);
+          else classes.delete(name);
+          return enabled;
+        },
+      };
     }
     querySelector() { return new Element(); }
     querySelectorAll() { return []; }
-    setAttribute() {}
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
     removeAttribute(name) { delete this[name]; }
-    append() {}
-    replaceChildren() {}
+    remove() { this.removed = true; }
+    append(...children) { this.children.push(...children); }
+    contains(element) { return element === this; }
+    replaceChildren(...children) { this.children = children; }
     add() {}
     focus() {}
     showModal() { this.open = true; }
@@ -50,9 +68,20 @@ function harness() {
     body: new Element(),
     querySelector: element,
     querySelectorAll: () => [],
-    createElement: () => new Element(),
+    createElement: (tagName) => new Element(tagName),
+    createElementNS: (_namespace, tagName) => new Element(tagName),
+    pictureInPictureEnabled: true,
     fullscreenElement: null,
   });
+  const video = element("#recording-video");
+  video.requestPictureInPicture = async () => {
+    document.pictureInPictureElement = video;
+    video.dispatchEvent(new Event("enterpictureinpicture"));
+  };
+  document.exitPictureInPicture = async () => {
+    document.pictureInPictureElement = null;
+    video.dispatchEvent(new Event("leavepictureinpicture"));
+  };
   const window = Object.assign(new EventTarget(), {
     setTimeout: (fn, delay) => { const timer = setTimeout(fn, delay); timer.unref(); return timer; },
     clearTimeout,
@@ -69,7 +98,7 @@ function harness() {
     },
   });
   vm.runInContext(source, context);
-  return { context, requests, element, video: element("#recording-video"), dialog: element("#player-dialog") };
+  return { context, requests, element, document, video, dialog: element("#player-dialog") };
 }
 
 function program(id) {
@@ -109,4 +138,107 @@ test("DVB subtitles restart server playback and Off removes the overlay", async 
   await h.context.selectSubtitle("");
   assert.match(h.video.src, /start=90&token=[a-f0-9]{32}$/);
   h.context.closePlayer();
+});
+test("closing during metadata fetch ignores a late response without saving zero", async () => {
+  const h = harness();
+  const opening = h.context.openPlayer(program(42));
+  const request = h.requests.find((r) => r.url === "/api/playback/42");
+  h.context.closePlayer();
+  assert.equal(request.options.signal.aborted, true);
+  respond(request, info(42));
+  await opening;
+  assert.equal(h.dialog.open, false);
+  assert.equal(h.video.src, undefined);
+  assert.equal(h.video.playCalls, 0);
+  assert.equal(h.requests.some((r) => r.url.endsWith("/position")), false);
+});
+
+test("an older recording response cannot replace the current recording", async () => {
+  const h = harness();
+  const first = h.context.openPlayer(program(42));
+  const second = h.context.openPlayer(program(43));
+  respond(h.requests.find((r) => r.url === "/api/playback/43"), info(43));
+  await settle();
+  h.video.dispatchEvent(new Event("loadedmetadata"));
+  await second;
+  respond(h.requests.find((r) => r.url === "/api/playback/42"), info(42));
+  await first;
+  assert.equal(h.video.src, "/api/playback/43/stream");
+  assert.equal(h.video.playCalls, 1);
+  h.context.closePlayer();
+});
+
+test("closing cancels media event waits and delayed saves cannot close a new player", async () => {
+  const h = harness();
+  const first = h.context.openPlayer(program(42));
+  respond(h.requests.find((r) => r.url === "/api/playback/42"), info(42));
+  await settle();
+  h.context.closePlayer();
+  await first;
+  const second = h.context.openPlayer(program(43));
+  respond(h.requests.find((r) => r.url === "/api/playback/43"), info(43));
+  await settle();
+  h.video.dispatchEvent(new Event("loadedmetadata"));
+  await second;
+  h.video.currentTime = 120;
+  h.context.closePlayer();
+  const saving = h.requests.find((r) => r.url.endsWith("/position"));
+  const third = h.context.openPlayer(program(44));
+  respond(saving, { saved: true });
+  await settle();
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.element("#player-title").textContent, "Recording 44");
+  h.context.closePlayer();
+  respond(h.requests.find((r) => r.url === "/api/playback/44"), info(44));
+  await third;
+});
+
+test("theater mode expands the shared player and can be exited", () => {
+  const h = harness();
+  h.element("#player-theater").dispatchEvent(new Event("click"));
+  assert.equal(h.dialog.classList.contains("theater-mode"), true);
+  assert.equal(h.element(".player-shell").classList.contains("theater-mode"), true);
+  assert.equal(h.element("#player-exit-theater").hidden, false);
+  h.element("#player-exit-theater").dispatchEvent(new Event("click"));
+  assert.equal(h.dialog.classList.contains("theater-mode"), false);
+  assert.equal(h.element("#player-exit-theater").hidden, true);
+});
+
+test("detach toggles Picture-in-Picture and exits theater mode", async () => {
+  const h = harness();
+  h.element("#player-theater").dispatchEvent(new Event("click"));
+  h.element("#player-detach").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(h.document.pictureInPictureElement, h.video);
+  assert.equal(h.dialog.classList.contains("theater-mode"), false);
+  assert.equal(h.element("#player-detach").getAttribute("aria-pressed"), "true");
+  h.element("#player-detach").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(h.document.pictureInPictureElement, null);
+  assert.equal(h.element("#player-detach").getAttribute("aria-pressed"), "false");
+});
+
+test("player icons use SVG DOM nodes instead of HTML parsing", () => {
+  const h = harness();
+  h.video.dispatchEvent(new Event("play"));
+  const icon = h.element("#player-toggle").children[0];
+  assert.equal(icon.tagName, "svg");
+  assert.equal(icon.children[0].tagName, "path");
+  assert.equal(icon.getAttribute("aria-hidden"), "true");
+  assert.doesNotMatch(source, /\.innerHTML\b/);
+});
+
+test("subtitle URLs use the matched numeric track metadata", async () => {
+  const h = harness();
+  vm.runInContext(
+    'activeVideo = { Id: 17 }; videoPlaybackInfo = { subtitles: [{ index: 2, language: "en", title: "English" }] };',
+    h.context,
+  );
+
+  await h.context.selectSubtitle("2");
+
+  assert.equal(
+    h.video.children[0].src,
+    "/api/videos/17/subtitles/2?start=0",
+  );
 });

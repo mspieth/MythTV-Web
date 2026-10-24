@@ -1,3 +1,0 @@
-Flask>=3.1,<4
-Gunicorn>=23,<24
-requests>=2.32,<3
