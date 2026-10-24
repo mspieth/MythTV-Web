@@ -1,5 +1,0 @@
--r requirements.txt
-
-black>=25,<27
-pytest>=8,<9
-ruff>=0.14,<1

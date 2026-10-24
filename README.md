@@ -8,31 +8,45 @@ It is mobile browser compatible and Android TV with TVBro.
 
 This started out as a fun project to play with AI and is not meant to replace the embedded browser found in MythTV itself.
 
-## Setup
+## Quick start
 
-From the project root, create and activate the local virtual environment, then install dependencies:
+On Linux, install uv with its official installer and verify it is available on your `PATH`:
 
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
 ```
 
-`requirements.txt` contains runtime dependencies; `requirements-dev.txt` adds pytest, Ruff, and Black.
+To install uv system-wide in `/usr/local/bin` instead (requires `sudo`):
 
-Node.js 20 or newer is needed to bundle browser assets after checkout or dependency updates:
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+/usr/local/bin/uv --version
+```
+
+Open a new terminal if `uv` is not found immediately after installation. For other platforms, see the [official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/). Install Node.js 20 or newer, then run these commands from the project directory:
 
 ```sh
 npm ci
 npm run build:browser
+uv run mythtv-web
 ```
+
+Open `http://127.0.0.1:6555/` in your browser. On first startup, sign in as `admin` with password `mythtv-admin`, then change the password when prompted. Stop the server with Ctrl+C.
+
+`uv run` creates the project's `.venv/` and installs Python dependencies automatically. Application dependencies and development tools are declared in `pyproject.toml`; `uv.lock` records the resolved versions. Rebuild browser assets after checkout or browser dependency updates. See [Run](#run) and [Background service](#background-service) for other ways to start the server.
 
 The build currently packages FFmpeg.wasm assets, but browser-side transcoding is disabled; the player does not load or use them. See the TODO under Browser playback.
 
 ## Recordings library
 
 The home page groups recordings by program title, like MythFrontend. Selecting a group shows all recordings in that group. Flask loads the full recorded-program list from MythTV's `Dvr/GetRecordedList` service and caches it under `.run/` for two minutes so every Gunicorn worker can serve complete groups consistently. The first group load can take several seconds for a large library. Flask also proxies cover art locally, so the browser does not connect to MythTV directly. The default backend URL is `http://127.0.0.1:6544`; set `MYTHTV_BACKEND_URL` if the local backend uses another address. Search and watched-state filters are available in both views.
+
+Each worker keeps a parsed copy of the recordings cache and checks the file's inode, modification time, and size before reusing it. Fresh reads avoid the shared refresh lock; deletion invalidates the disk cache so all workers notice the change on their next lookup.
+
+## Videos library
+
+The Videos tab lists MythTV video-library entries from `Video/GetVideoList`, with search, watched-state filters, artwork, and browser playback. If artwork is missing or its file is unavailable, Flask generates and caches a poster frame from `Content/GetVideo`; this fallback requires system `ffmpeg`. Video streams are served through Flask, and watched status updates use `Video/UpdateVideoWatchedStatus`. MythTV service URLs remain server-side.
 
 ## Guide and backend status
 
@@ -42,7 +56,9 @@ The Upcoming tab shows scheduled programs, while Guide browses a four-hour progr
 
 The Flask app requires sign-in for the library and API; `/healthz` remains public. Accounts are stored in `.run/users.sqlite` with Werkzeug password hashes. On an empty account database, the app creates the initial administrator `admin` with password `mythtv-admin`; that account must change its password at first sign-in. Override the initial account before the first start with `MYTHTV_INITIAL_ADMIN_USERNAME` and `MYTHTV_INITIAL_ADMIN_PASSWORD`. The password setting is only used when the database has no users; it does not reset existing credentials. New accounts are also required to change their initial password. Admins manage users, roles, and passwords at `/admin/users`; supported roles are `admin`, `user`, and `guest`. Guest accounts otherwise behave like users but cannot delete recordings or recording rules.
 
-`MYTHTV_AUTH_DATABASE` selects another account database path. Authentication cookies are persistent for 365 days by default and refresh while the user is active; set `MYTHTV_SESSION_LIFETIME_DAYS` to choose another lifetime. Flask creates and persists a random session-signing key under `.run/` by default; set `MYTHTV_SECRET_KEY` to supply a stable key explicitly, and keep it private. Set `MYTHTV_SESSION_COOKIE_SECURE=1` when all browser access uses HTTPS. For deployments using the known initial password, change it immediately on first sign-in; preferably set a unique `MYTHTV_INITIAL_ADMIN_PASSWORD` before the first start.
+`MYTHTV_AUTH_DATABASE` selects another account database path. Authentication cookies are persistent for 365 days by default and refresh while the user is active; set `MYTHTV_SESSION_LIFETIME_DAYS` to choose another lifetime. Flask creates and persists a random session-signing key under `.run/` by default; set `MYTHTV_SECRET_KEY` to supply a stable key explicitly, and keep it private. The selected key is persisted beside the account database so sessions survive restarts even if the environment variable is omitted later; changing the key signs out existing sessions. Set `MYTHTV_SESSION_COOKIE_SECURE=1` when all browser access uses HTTPS. For deployments using the known initial password, change it immediately on first sign-in; preferably set a unique `MYTHTV_INITIAL_ADMIN_PASSWORD` before the first start.
+
+Existing account databases are migrated automatically on startup. The session-security upgrade requires existing users to sign in again. Password changes revoke other sessions while keeping the changing user's current session; administrator password resets revoke all sessions for the affected account. Session cookies use `SameSite=Strict` by default.
 
 ## Browser playback
 
@@ -58,6 +74,10 @@ sudo apt install ffmpeg
 
 Seeking within buffered media stays local; seeking outside the buffer restarts the server transcode at the requested position. Commercial skipping is available only when MythTV has commercial-break markers for the recording.
 
+Server transcoding uses Linux process identity and pidfds for safe cancellation across workers. Jobs belong to the starting account session and recording. At most two transcodes run concurrently by default; additional requests receive `503` until a slot is free. Set `MYTHTV_MAX_TRANSCODES` to change this limit and `MYTHTV_FFMPEG_THREADS` to change the decoder, encoder, and filter thread budgets (default: two each). Both settings must be positive integers. These limits leave Gunicorn threads available for navigation and account requests.
+
+Successful subtitle extractions for completed recordings are cached under `.run/subtitles/` for up to 24 hours, retaining at most 128 files. The cache key includes the recording's file metadata, source URL, and subtitle stream. Concurrent requests for the same track share an extraction; recordings still in progress are extracted afresh. Set `MYTHTV_SUBTITLE_CACHE_DIR` to select another cache directory.
+
 ### TODO: Revisit FFmpeg.wasm
 
 FFmpeg.wasm is the FFmpeg media toolkit compiled to WebAssembly, a portable format that lets the browser run compiled code without installing a native FFmpeg program on the client. If enabled, MythTV Web can send the recording stream through Flask to the browser, convert it there to fragmented MP4, and feed the result to the video element with MediaSource. That can avoid server-side transcoding and help devices whose browser cannot decode the recording's original codecs.
@@ -70,12 +90,14 @@ Before enabling the feature, make its selection capability-based, confirm the bu
 
 ## Quality checks
 
-Run these checks before committing Python changes:
+Run these checks before committing changes:
 
 ```sh
-black .
-ruff check .
-pytest
+uv run ruff format --check .
+uv run ruff check .
+uv run pytest
+npm run test:browser
+npm run build:browser
 ```
 
 ## Run
@@ -83,16 +105,18 @@ pytest
 For local development:
 
 ```sh
-flask --app 'mythtv_web:create_app' run --host 0.0.0.0 --port 6555
+uv run mythtv-web
 ```
 
 For the Apache-facing server process:
 
 ```sh
-gunicorn --workers 2 --worker-class gthread --threads 8 --timeout 120 --bind 0.0.0.0:6555 'mythtv_web:create_app()'
+uv run gunicorn --workers 2 --worker-class gthread --threads 8 --timeout 120 --bind 0.0.0.0:6555 'mythtv_web:create_app()'
 ```
 
 The landing page is at `/`; `/healthz` returns a small JSON health response. Stop the process with Ctrl+C when running it in the foreground.
+
+In VS Code, use **Terminal > Run Task > uv: run app** to run the same command. For debugging, select **Python: MythTV-Web** in Run and Debug and press **F5**. The launch configuration syncs dependencies first, then uses the workspace's `.venv/bin/python` and serves `http://127.0.0.1:6555/`. Build browser assets using the quick-start commands above before the first run. Stop any server already using port 6555 before starting another instance.
 
 ## Background service
 
@@ -110,7 +134,7 @@ The launcher requires dependencies to be installed in `.venv/`. It only stops th
 
 ## Apache reverse proxy
 
-The example Apache snippet is [`config/apache/mythtv-web.conf`](config/apache/mythtv-web.conf). It serves the app at `https://mythtv.example.com/mythtv-web/` and redirects HTTP to HTTPS. Authentication is handled by the Flask app; Apache does not add a second login prompt. Replace `mythtv.example.com` in the snippet with the canonical DNS name covered by your HTTPS certificate. The Flask/Gunicorn service binds to all interfaces on port 6555; Apache forwards the `/mythtv-web/` prefix so the page's static files and API requests use the same path.
+The example Apache snippet is [`config/apache/mythtv-web.conf`](config/apache/mythtv-web.conf). It serves the app at `https://mythtv.example.com/mythtv-web/` and redirects HTTP to HTTPS. Authentication is handled by the Flask app; Apache does not add a second login prompt. Replace `mythtv.example.com` in the snippet with the canonical DNS name covered by your HTTPS certificate. The Flask/Gunicorn service binds to all interfaces on port 6555; Apache forwards the `/mythtv-web/` prefix so the page's static files and API requests use the same path. The Apache snippet includes `ProxyPassReverseCookiePath / /mythtv-web/` to scope Flask's session cookie to this application path.
 
 On Debian or Ubuntu, install the snippet as root:
 
@@ -139,7 +163,7 @@ An unauthenticated browser request should redirect to the Flask login page; unau
 
 ## Nginx reverse proxy
 
-Nginx can serve the same `/mythtv-web/` URL prefix. Add a port 80 redirect and the following locations to the site's HTTPS `server` block, replacing the hostname and certificate paths with your own:
+Nginx can serve the same `/mythtv-web/` URL prefix. Add a port 80 redirect and the following locations to the site's HTTPS `server` block, replacing the hostname and certificate paths with your own. Apply the session-cookie path rewrite in the reverse proxy that directly fronts Flask: use this Nginx directive when Nginx is that proxy, or Apache's `ProxyPassReverseCookiePath` above when Apache is; do not configure both for the same response.
 
 ```nginx
 server {
@@ -160,6 +184,7 @@ server {
 
 	location /mythtv-web/ {
 		proxy_pass http://127.0.0.1:6555/;
+		proxy_cookie_path / /mythtv-web/;
 		proxy_http_version 1.1;
 		proxy_set_header Host $host;
 		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
