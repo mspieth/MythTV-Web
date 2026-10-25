@@ -267,3 +267,29 @@ test("subtitle URLs use the matched numeric track metadata", async () => {
     "/api/videos/17/subtitles/2?start=0",
   );
 });
+
+test("delete confirmation checkbox is enabled when opening another recording", async () => {
+  const h = harness();
+  h.context.window.scrollTo = () => {};
+  const checkbox = h.element("#delete-confirm-check");
+  const confirmButton = h.element("#delete-confirm-button");
+
+  h.context.showDeleteDialog(program(42));
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new Event("change"));
+  confirmButton.dispatchEvent(new Event("click"));
+
+  const request = h.requests.find((item) => item.url === "/api/recordings/42");
+  assert.ok(request);
+  assert.equal(checkbox.disabled, true);
+  respond(request, { deleted: true });
+  await settle();
+  assert.equal(h.element("#delete-dialog").open, false);
+
+  h.context.showDeleteDialog(program(43));
+  assert.equal(checkbox.disabled, false);
+  assert.equal(h.element("#delete-dialog-cancel").disabled, false);
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new Event("change"));
+  assert.equal(confirmButton.disabled, false);
+});
