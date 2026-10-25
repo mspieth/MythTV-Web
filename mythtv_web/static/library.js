@@ -1188,7 +1188,9 @@ function makeRecordingAction(label, iconParts, handler) {
 function showDeleteDialog(program) {
   pendingDelete = program;
   deleteCheckbox.checked = false;
+  deleteCheckbox.disabled = false;
   deleteButton.disabled = true;
+  deleteCancelButton.disabled = false;
   deleteStatus.textContent = "";
   document.querySelector("#delete-recording-name").textContent =
     program.SubTitle || program.Title || "Untitled recording";
