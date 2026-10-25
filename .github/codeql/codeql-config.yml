@@ -1,0 +1,4 @@
+name: "Mythserver CodeQL configuration"
+
+queries:
+  - uses: security-extended
