@@ -129,7 +129,6 @@ Use the launcher to manage Gunicorn in the background. It records its PID and wr
 ./scripts/mythtv-web.sh stop
 ```
 
-The root-level `launch_server.sh` accepts the same commands and delegates to this service manager.
 The launcher requires dependencies to be installed in `.venv/`. It only stops the Gunicorn process identified by its own PID file and refuses to signal a different process. Gunicorn access and error output is written to `.run/mythtv-web-YYYY-MM-DDT000000.log`, where the timestamp is the start of that log day in the server's local timezone. Rotation happens at local midnight; at most 10 dated log files are retained, including the active file. Existing logs with the previous `gunicorn-` prefix are migrated when the service starts.
 
 ## Apache reverse proxy
