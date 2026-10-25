@@ -202,3 +202,5 @@ The trailing slash on `proxy_pass` removes `/mythtv-web/` before forwarding the 
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+Embedded CEA-608 CC1 and CEA-708 service 1 captions use the optional system `mythccextractor` executable on Gunicorn's `PATH`. Install the MythTV package providing `mythccextractor` on the MythTV Web host, and ensure it can load the local MythTV configuration under the server account. FFmpeg converts its SRT output to WebVTT. When it is available, the subtitle selector offers both caption services labelled “if present”; these are extraction choices, not confirmed track discovery. Caption extraction downloads the recording into a temporary file (maximum 8 GiB), with a 120-second processing budget, and returns WebVTT text. Temporary files are removed after each request, and growing recordings are not cached. Empty or absent services report a caption load failure. Other caption channels and CEA-708 services are not yet selectable.

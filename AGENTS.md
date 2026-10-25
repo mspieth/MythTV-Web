@@ -24,7 +24,8 @@ This project is a Python web server that provides a browser-based interface to t
 16. Register server transcodes atomically across workers, associate each with its account session and recording, and verify Linux process identity before cancellation through a pidfd. Bound concurrent transcodes and FFmpeg thread use with `MYTHTV_MAX_TRANSCODES` and `MYTHTV_FFMPEG_THREADS` (both default to two).
 17. Keep backend response validation, recording caches, subtitle extraction, and transcode job management in focused modules. Recording-cache reads must notice invalidation across workers. Cache completed-recording subtitles for at most 24 hours with no more than 128 files, and never cache growing recordings' subtitles.
 18. Use https://pydevtools.com/handbook/explanation/modern-python-project-setup-guide-for-ai-assistants.md as the authoritative playbook.
-19. Burn selected DVB bitmap subtitles into server-transcoded video; validate the requested stream against the recording subtitle metadata.
+19. Support embedded CEA-608 CC1 and CEA-708 service 1 through optional server-side mythccextractor extraction to WebVTT.
+20. Burn selected DVB bitmap subtitles into server-transcoded video; validate the requested stream against the recording subtitle metadata.
 
 ## Development Guidance
 

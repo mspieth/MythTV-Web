@@ -1903,3 +1903,19 @@ def test_artwork_proxy_rejects_arbitrary_upstream_urls(monkeypatch):
 
     assert response.status_code == 400
     assert response.json == {"error": "Invalid artwork URL"}
+
+
+def test_caption_endpoint_validates_service_and_handles_missing_tool(monkeypatch):
+    from mythtv_web import create_app
+
+    monkeypatch.setattr("mythtv_web._active_recording", lambda *_: {"Title": "Example"})
+    monkeypatch.setattr("mythtv_web.shutil.which", lambda _: None)
+    client = create_app().test_client()
+    assert client.get("/api/playback/42/captions/unknown").status_code == 404
+    assert client.get("/api/playback/42/captions/cea708").status_code == 501
+    monkeypatch.setattr("mythtv_web.shutil.which", lambda _: "/usr/bin/mythccextractor")
+    monkeypatch.setattr("mythtv_web.extract_captions", lambda *_: b"WEBVTT\n\n")
+    response = client.get("/api/playback/42/captions/cea608")
+    assert response.status_code == 200
+    assert response.content_type.startswith("text/vtt")
+    assert response.headers["Cache-Control"] == "no-store"

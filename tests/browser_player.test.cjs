@@ -139,6 +139,31 @@ test("DVB subtitles restart server playback and Off removes the overlay", async 
   assert.match(h.video.src, /start=90&token=[a-f0-9]{32}$/);
   h.context.closePlayer();
 });
+
+test("embedded captions use their endpoint and align cues to server playback", async () => {
+  const h = harness();
+  const opening = h.context.openPlayer(program(42));
+  const metadata = info(42);
+  metadata.media.subtitles = [{ index: "cea708", codec: "cea708", title: "CEA-708" }];
+  respond(h.requests.find((r) => r.url === "/api/playback/42"), metadata);
+  await settle();
+  h.video.dispatchEvent(new Event("loadedmetadata"));
+  await opening;
+  let track;
+  h.context.document.createElement = () => {
+    track = new EventTarget();
+    track.remove = () => {};
+    track.track = { cues: [{ startTime: 100, endTime: 105 }], mode: "disabled" };
+    return track;
+  };
+  h.element("#subtitle-track").value = "cea708";
+  h.context.startTranscode(90);
+  assert.equal(track.src, "/api/playback/42/captions/cea708");
+  track.dispatchEvent(new Event("load"));
+  assert.equal(track.track.cues[0].startTime, 10);
+  assert.equal(track.track.cues[0].endTime, 15);
+  h.context.closePlayer();
+});
 test("closing during metadata fetch ignores a late response without saving zero", async () => {
   const h = harness();
   const opening = h.context.openPlayer(program(42));

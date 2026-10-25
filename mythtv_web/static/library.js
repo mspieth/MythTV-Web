@@ -374,8 +374,8 @@ function startTranscode(seconds = 0) {
     : `/api/playback/${activeRecording.Recording.RecordedId}/transcode`;
   playerVideo.src = appPath(`${transcodePath}?start=${encodeURIComponent(seconds)}&token=${transcodeToken}${subtitleQuery}`);
   playerVideo.load();
-  if (subtitleElement) {
-    selectSubtitle(document.querySelector("#subtitle-track").value);
+  if (subtitleElement || ["cea608", "cea708"].includes(selectedSubtitle)) {
+    selectSubtitle(selectedSubtitle);
   }
   playerVideo.play().catch(() => {
     if (generation === playerGeneration && token === transcodeToken) {
@@ -414,7 +414,7 @@ async function selectSubtitle(streamIndex) {
     ? videoPlaybackInfo?.subtitles || []
     : playbackInfo?.media.subtitles || [];
   const trackInfo = tracks.find(
-    (track) => Number.isSafeInteger(track.index) && String(track.index) === streamIndex,
+    (track) => (Number.isSafeInteger(track.index) || (!activeVideo && ["cea608", "cea708"].includes(track.index))) && String(track.index) === streamIndex,
   );
   if (activeRecording && (trackInfo?.codec === "dvb_subtitle" || burnedSubtitle !== null)) {
     const desiredSubtitle = trackInfo?.codec === "dvb_subtitle" ? String(trackInfo.index) : null;
@@ -437,13 +437,23 @@ async function selectSubtitle(streamIndex) {
       : `Track ${streamIndex}`
   );
   track.srclang = /^[a-z]{2,3}$/i.test(trackInfo.language) ? trackInfo.language : "und";
+  const caption = !activeVideo && ["cea608", "cea708"].includes(safeStreamIndex);
   const subtitlePath = activeVideo
     ? `/api/videos/${resourceId}/subtitles/${safeStreamIndex}`
-    : `/api/playback/${resourceId}/subtitles/${safeStreamIndex}`;
+    : `/api/playback/${resourceId}/${caption ? "captions" : "subtitles"}/${safeStreamIndex}`;
   const subtitleStart = usingTranscode || usingWasm ? transcodeBase : 0;
-  track.src = appPath(`${subtitlePath}?start=${encodeURIComponent(subtitleStart)}`);
+  track.src = appPath(caption ? subtitlePath : `${subtitlePath}?start=${encodeURIComponent(subtitleStart)}`);
   track.addEventListener("load", () => {
     if (generation !== playerGeneration || subtitleElement !== track) return;
+    if (caption && subtitleStart > 0) {
+      for (const cue of Array.from(track.track.cues || [])) {
+        if (cue.endTime <= subtitleStart) track.track.removeCue(cue);
+        else {
+          cue.startTime = Math.max(0, cue.startTime - subtitleStart);
+          cue.endTime -= subtitleStart;
+        }
+      }
+    }
     track.track.mode = "showing";
     playerStatus.textContent = `Subtitles: ${track.label}`;
   });
